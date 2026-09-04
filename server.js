@@ -1,3 +1,5 @@
+'use strict';
+
 /**
  * Saltwater render service
  *
@@ -195,6 +197,63 @@ async function probeDuration(file) {
   const seconds = Number(stdout);
   if (!Number.isFinite(seconds)) throw new Error(`ffprobe returned no duration for ${file}`);
   return seconds;
+}
+
+/**
+ * Mean level of a slice of audio, in dBFS.
+ *
+ * volumedetect reports on stderr, so this calls ffmpeg directly rather than
+ * through the `ffmpeg` helper, which forces `-v error` and would suppress the
+ * very line being parsed.
+ */
+async function meanVolume(file, startSec, lenSec) {
+  const r = await run('ffmpeg', [
+    '-hide_banner', '-nostats',
+    '-ss', String(Math.max(0, startSec)), '-t', String(lenSec),
+    '-i', file, '-af', 'volumedetect', '-f', 'null', '-',
+  ], { timeoutMs: 3 * 60 * 1000 });
+  const m = r.stderr.match(/mean_volume:\s*(-?[\d.]+) dB/);
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * Measure one music bed.
+ *
+ * Integrated loudness (LUFS) is how loud the bed feels overall; the head and
+ * tail levels are what actually matter at a join, because the session render
+ * concatenates beds with a hard cut. A four-second window rather than an
+ * instant, so a single quiet moment does not masquerade as a level change.
+ */
+async function measureTrack(file) {
+  const duration = await probeDuration(file);
+  let integrated = null;
+  let truePeak = null;
+  let range = null;
+  try {
+    const r = await run('ffmpeg', [
+      '-hide_banner', '-nostats', '-i', file,
+      '-af', 'loudnorm=print_format=json', '-f', 'null', '-',
+    ], { timeoutMs: 5 * 60 * 1000 });
+    const m = r.stderr.match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
+    if (m) {
+      const j = JSON.parse(m[0]);
+      integrated = Number(j.input_i);
+      truePeak = Number(j.input_tp);
+      range = Number(j.input_lra);
+    }
+  } catch (err) {
+    // A bed that cannot be analysed should not fail the whole report.
+    integrated = null;
+  }
+  const win = Math.min(4, Math.max(1, duration / 10));
+  return {
+    duration_sec: Math.round(duration),
+    integrated_lufs: integrated,
+    true_peak_dbtp: truePeak,
+    loudness_range_lu: range,
+    head_dbfs: await meanVolume(file, 0, win),
+    tail_dbfs: await meanVolume(file, duration - win, win),
+  };
 }
 
 async function probeStreams(file) {
@@ -1375,6 +1434,64 @@ app.post('/jobs/short', (req, res) => {
     await fsp.rm(file, { force: true });
     step(j, 'deleted local render after successful upload');
     return { video_id: videoId, disk: await diskUsage() };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Measure every music bed and the step at each join.
+ *
+ * A session strings the beds end to end with a hard cut and no crossfade, so
+ * a bed that ends 4 dB below where the next one starts is an audible jump —
+ * roughly every twenty minutes, to someone who is trying to fall asleep. This
+ * is the one part of the pipeline nobody can check by eye, and nobody had
+ * checked by ear either.
+ *
+ * Joins are reported in filename order and wrap from the last bed back to the
+ * first, which is the order WF-A cycles them in.
+ */
+app.post('/jobs/audio', (_req, res) => {
+  const job = startJob('audio', {}, async (j) => {
+    const files = (await fsp.readdir(DIRS.tracks).catch(() => []))
+      .filter((f) => f.endsWith('.mp3')).sort();
+    if (!files.length) throw new Error('no music beds on the volume');
+
+    const tracks = [];
+    for (const f of files) {
+      step(j, `measuring ${f}`);
+      const m = await measureTrack(path.join(DIRS.tracks, f));
+      tracks.push(Object.assign({ slug: f.slice(0, -4) }, m));
+    }
+
+    const joins = [];
+    for (let i = 0; i < tracks.length; i += 1) {
+      const a = tracks[i];
+      const b = tracks[(i + 1) % tracks.length];
+      const stepDb = (a.tail_dbfs === null || b.head_dbfs === null)
+        ? null : Number((b.head_dbfs - a.tail_dbfs).toFixed(1));
+      const lufsStep = (a.integrated_lufs === null || b.integrated_lufs === null)
+        ? null : Number((b.integrated_lufs - a.integrated_lufs).toFixed(1));
+      let verdict = 'unknown';
+      if (stepDb !== null) {
+        const abs = Math.abs(stepDb);
+        if (abs < 1.5) verdict = 'inaudible';
+        else if (abs < 3) verdict = 'noticeable';
+        else verdict = 'audible jump';
+      }
+      joins.push({ from: a.slug, to: b.slug, level_step_db: stepDb, loudness_step_lu: lufsStep, verdict });
+    }
+
+    const worst = joins.reduce((acc, x) => {
+      if (x.level_step_db === null) return acc;
+      if (!acc || Math.abs(x.level_step_db) > Math.abs(acc.level_step_db)) return x;
+      return acc;
+    }, null);
+
+    const lufs = tracks.map((t) => t.integrated_lufs).filter((n) => Number.isFinite(n));
+    const spread = lufs.length
+      ? Number((Math.max(...lufs) - Math.min(...lufs)).toFixed(1)) : null;
+
+    return { tracks, joins, worst_join: worst, loudness_spread_lu: spread };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
