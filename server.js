@@ -931,27 +931,56 @@ async function makeStockVisual(job, { slug, aspect, query, dim, vivid, exclude, 
 }
 
 /**
- * Turn a still into ten seconds of slow movement.
+ * Turn a still into a slow, drifting move that returns exactly to where it
+ * started.
  *
- * The zoom is palindromic — fully in at the midpoint, back out by the end —
- * so the last frame matches the first and buildLoop's crossfade has nothing
- * to hide. A one-way zoom would snap back visibly every ten seconds, which is
- * exactly the kind of repeated jolt that wakes someone up.
+ * A session can now hold a single picture for two hours, so the number that
+ * matters is not how far the frame moves but how often the movement comes
+ * back around. At the old ten-second cycle a two-hour session breathed in and
+ * out 720 times, which is often enough to notice. Thirty seconds is 240, and
+ * at this speed that reads as drift rather than as a loop.
+ *
+ * Three things move, all on cosines of the same period so all three land back
+ * at their starting value on the last frame:
+ *
+ *   zoom   1.10 -> 1.18, one full cycle
+ *   x      one cycle left and right
+ *   y      two cycles up and down
+ *
+ * One horizontal cycle against two vertical ones traces a figure of eight, so
+ * the frame never retraces its own path and the movement does not read as
+ * mechanical. The last frame still equals the first, which is what lets
+ * buildLoop close the loop invisibly.
+ *
+ * The base zoom sits at 1.14 rather than 1.045 because panning needs somewhere
+ * to pan to: at 1.14 there is about 6% of the frame in reserve on each side and
+ * the drift uses 4.2% of it. Measured at the extremes of the move, no black
+ * edge ever enters frame. It costs roughly a tenth of the picture, which a
+ * 2848-wide source can afford without going soft at 1080p.
  *
  * The source is scaled to double the target first: zoompan samples from the
- * upscaled frame, which is what keeps a slow push from looking like it is
- * stepping between pixels.
+ * upscaled frame, which is what keeps a slow push from stepping between pixels.
  */
 async function stillToClip(srcPath, outPath, scale) {
   const parts = scale.split(':');
   const w = Number(parts[0]);
   const h = Number(parts[1]);
-  const frames = 300; // 10s at 30fps
+  const seconds = clampNum(Number(process.env.STILL_MOTION_SECONDS), 5, 120, 30);
+  const frames = Math.round(seconds * 30);
+  // Amplitude as a fraction of the frame, so 9x16 drifts like 16x9 does.
+  // 0.038 leaves about 26px of unused reserve at the tightest moment of the
+  // move — the point where the vertical drift peaks while the zoom happens to
+  // be near its widest. Raising this to 0.042 still works but cuts that to 17px,
+  // which is too little to absorb a rounding difference in another ffmpeg build.
+  const driftX = clamp01(Number(process.env.STILL_DRIFT ?? 0.038));
+  const driftY = driftX;
   const filter = [
     `scale=${w * 2}:${h * 2}:force_original_aspect_ratio=increase:flags=lanczos`,
     `crop=${w * 2}:${h * 2}`,
-    `zoompan=z='1.045+0.045*cos(2*PI*on/${frames})':d=${frames}`
-      + `:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=30`,
+    `zoompan=z='1.14+0.04*cos(2*PI*on/${frames})':d=${frames}`
+      + `:x='iw/2-(iw/zoom/2)+${driftX}*iw*sin(2*PI*on/${frames})'`
+      + `:y='ih/2-(ih/zoom/2)+${driftY}*ih*sin(4*PI*on/${frames})'`
+      + `:s=${w}x${h}:fps=30`,
     'format=yuv420p',
   ].join(',');
   await ffmpeg([
