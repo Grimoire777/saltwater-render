@@ -285,6 +285,272 @@ function startJob(kind, input, worker) {
   return job;
 }
 
+// -------------------------------------------------------------------- brand
+
+/**
+ * The SALTWATER lockup, burned into every loop as a corner mark.
+ *
+ * It lives here as base64 rather than as a file in the repo for one reason:
+ * server.js is the only thing that gets pasted into GitHub, so a mark that
+ * travels inside it can never go missing, and the Dockerfile never has to
+ * learn about a second file. Thirteen kilobytes is a fair price for that.
+ *
+ * The mark goes on at loop-build time, not at session time. The session render
+ * stream-copies its loops for two hours; overlaying there would force a full
+ * re-encode and cost hours of CPU per night. Overlaying here costs nothing —
+ * the loop is being encoded anyway — and every session and Short inherits it.
+ *
+ * Consequence worth knowing: changing or removing the mark means re-looping
+ * the library (/jobs/reloop), not re-rendering anything.
+ */
+const LOCKUP_B64 =
+    'iVBORw0KGgoAAAANSUhEUgAAA7MAAAGqCAQAAABzUdueAAAzmklEQVR42u3da6AdVX338d/EBEy4JCGBJiAQEoRAIRVULoKU'
+  + 'S7lUQO5SRAWEUANiaIEKVEIVW+OjIIYiPJpUoAK2IRi0oZqIRBqKpDR5NLEkD54oiXKCniiJmAiJTF/sOTt777nsuaw1t/39'
+  + 'nBfnnJk9a9asWTP/WWvPrHFcAQAAO4ZQBAAAEGYBACDMAgAAwiwAAIRZAAAIswAAgDALAABhFgAAwiwAACDMAgBAmAUAoE6G'
+  + 'UgRABeyr63SCNmuthkkar1W6TgMUC1B+Dq8OAMp4ZOpBXRT701s0SzdSaABhFkC08Zqt92RYfp1O1E8oRqA8+G4WKIdz5MrV'
+  + 'S5mCrLS3XpArVxdToABhFoAkvU2uXD0aMGe5Pq6hciJ+dtbfa2XAkl+TK1cHUbhA0eg0Bor0rI7wTVusc/RKirR20vcCUntc'
+  + 'p1PMAGEW6D1bfXf6X6svGkj3Kt3tP9IpbqAYdBoDReiX2xZkL5Mjx0iQlb4kR46ubpvmqp9CB2jNAr0RYse1/LdGkyyua632'
+  + 'zm1dAGjNAgWbJrclyC6VYznw7SNHy5v/TZSr69kJAK1ZoJ5aD7fVmpzjmpfomNbjnl0B0JoF6mV+S5DdJCfXICsdK0dbWsL9'
+  + 'THYIQGsWqGc71iEfAK1ZADaC25yCg5ujmwNDLgBas0AlzdGHS9d+3H7Y36Hr2EUAYRaoqhe1j/dXuR6m2T761I/0J+wmgDAL'
+  + 'VNH2w+s0fadkeXu3nipdKxsgzAJIEWQdcgj0Km6BAno3hDkBuQVAmAUIsgRagDALEGTL3xlLoAUIswBBlkALEGYBSGsrFmTb'
+  + 'c8rr8gDCLFBi1zZfPFete3cHcztON7ETAaMHF71EgEFuJYNs9fMO0JoFCLIVadFy7Q0QZoESB9mpld2C6wi0AGEWKKfBN7gu'
+  + '0+zKbsMdetb7azo7FDCD72YBs21Zh+0AQGsWIDiFXHp3bBEAwixQsNu934/UYmsWeb95tAcwceXKJStAW7bm2wPQmgUq7Nna'
+  + 'BaXB88JCdi5Aaxag7cc2AbRmgZraWMuAxI1QAGEWKIVdJUmv1W671rNrASPXrFysAhnUuXOVjmOA1ixQCktruVWPs2MBwixQ'
+  + 'pCXe7yMtruMJnZlquRF6RvtmWvPp3u9n2dFAenQaA+nZ7VZtPzj3TPDK9QGNafnvOP1HKbcPoDULIMKeFoPQ6b57fF+Kedfv'
+  + 'qXLbgqz0VOr7hQe3bG92NkBrFqhPWzb8sJygFxMsucm7Dzp9LmnPArRmgUJ9IMUyb9abIuZ+v/nXSDnezxxvys90Vqwgu5cc'
+  + 'ORopRw80541JkdMr2cEArVmgCKfq2ynbedfrc5LWaZ/IUNk5/53N+5mdLkH2aR3bNv0Xze7tT+uWlO3Zo/UDdjlAmAXyk747'
+  + 'dXDJL+pa37wlOiY01VP0He+vifppaKqrNdk370kdnzm3dBsDqdBpDGSRpsv4Zu/39I5vUt8s1wuywRY2Q90aPdQ2Z8eWluzk'
+  + 'gCVP0MckSZ/MaQsB0JoFMtnVG8s4bRtv+4F3sJ7vmLJBY0OX200bmn/vrN91LBnWEW2i3X6AXmC3A7RmgXysy3qB2/zrf+TK'
+  + 'bQmVt0YEWenXLUu+2rHkHVaC7PZ8AqA1C+SkceBs0sgMacwPuGs4Xuu4X+NSLpnGZg23vAaA1iyAAG/LtPTZcrSm5f8psQPZ'
+  + 'eDlt4yi/12oInMKOBmjNAkW0Zk0FN6fk73U1u7UArVkAkaZbCWNldzE7HqA1C+Rh8LvRXmnfNU4T66zeYgXQmgXgaQTZh3tm'
+  + 'extbygsEAMIskKNZPbOls9nZQFp0GgPJ9d4tQdwEBdCaBWpkvDf0hCtXmzOlNL8lpasoWIAwC5TdMMvpT5Orl1r+Hy5Xrt6a'
+  + 'qg3qtg2BcbdcrciQswnsfCApOo2BpHbQa42jx0rq4Ydksjt9t2po6Lzh+n2qXI3yRnIGQGsWsOYr1lI+NfIJ2r0TPF/rRgRZ'
+  + 'aYtmpsoft0IBhFnAuhGW0r3Ue1G89LQkabIcOR3fp7o6N3GL+Go5cry29+BDSB8XHVkAYRaoic1tb9IJdra+2vz7UDlytFqS'
+  + 'dI8cOVrenDdP5ycIsjvI0Ze8vx05elXStsBgDIAwC5TC1oSfP9d7w01UWHtI32j+/YGA9/4crhua4XGuzghNZ2jLWhbL8eX1'
+  + 'Sjkt3clJu45HsPMBwixQNte0tDOdkPbnRc2/HT0Y+JnP66jm39/SwsDPTGsJqyt1Qkh+tufhdHYOQJgFyibpAz2t4e4NHeAL'
+  + 'etvbn49E3r383zqp+ffJAW3jjc3uYem3OjQipV2834cm3JLN7HyAMAvYtjXxEo4WN/+eJ1czWtqxb7R87oIu6XyvbVxhV33N'
+  + 'vxfK1drmf+/SrpHpvCpHOzCmE0CYBeoRZqUT9FHvr0MkfbI5LlN7MO7u522fmthM52QvZUl6h56xtBUAkl9lc7MhkNAI/S52'
+  + 'WGz1Vv3/0Hlf0wcTpORGtpxtaKxxZ2/LARBmAYvSD6TvGgqNI/VKwNTlOtzqFu+tn7PzgWToNAZyvbDVjh1TzkwVrjfK6Xjf'
+  + '7QY51oLsIIIsQGsWKHVrdrtRge3RNN6qFyqxxQCtWQAJnJFp6VeM5cN+kH03OxsgzAJ5O7tntvQSdjaQFp3GQHLLdFjj+OmR'
+  + '7W2cJjZoLLseoDUL2HdbT2719ex4gNYskGf7zmFrAdCaBWx5R09s5QHsaIDWLFBE+25TwCvrymRXbTKQSr/G0ZoFaM0CeVrn'
+  + 'hTGbrmyOWOwmfAX7J7xlNiZeMkgjyG5gpwO0ZoG87OWNiGSvhec/NOMOpehfcnHou2fjpzdBL7LbAVqzQD5+4f2+2ErqPwxs'
+  + 'gx4Wo2X6YuBnjs/Qpp3aTBkArVkgN4OHjvn27MZmZ/Tgd79/pPXNuVFvydms4duPbUnSu/VUx5TybCdAaxZAqKNTL3m3XLm6'
+  + 'KWRuXzPIOs0brF5uCXKvRgTE4c0lBz//H3K0ujl/egFbCxBmAaTwA+/31MRLXiVJ+gctCJi3QhNDWo+OjmuGy9MiUv+xb8nJ'
+  + '+ifvrzsT53Vqx9YCSIhOYyCttN2pV+sfvb86hy9cq70j05yiH3p/HaP/bJsz+NBN2JKN+R/TXTltIwDCLJDRRPWlDkHbD7zR'
+  + '3rt6ZumalpZrmP20pvn3nuqXJD2p470p5p/jbeTzHfpvdjdAmAWq0p5tD7TttmhE5HL76mfhx3OJtg+AJL6bBbLIMsZScOi6'
+  + 'skuQlV4MWfId1oLhOnY0QJgFijDYRbsiZaB19HJHoPxK7CVXt/w/Q46Fbt3BW7T2YUcDGa6o6TQGMjDRrXqajteNqZa8VKfr'
+  + 'glJvG0CYJcwCBoLR8zq4Ztv1Y2+LCLIAYRYo0FYNrWU4apwaOh85AkCYBQoJSPUKtHQYA4ZwCxSQ1XLv9+71ufz2fq9k5wK0'
+  + 'ZgHafmwPQGsWqLGbvd/P1mJr5nu/r2THArRmAdp/bAtAaxao+wVrR4giyAIgzAIGPeb9Xl3prVjm/X6cHQoQZoEyOdv7fYBu'
+  + 'rew2fFaHeX+dzg4FzOC7WcCcqne40mEM0JoFSmxkR7iqZpDdiR0JEGaBMtqkv6lsoB3M8Q3azI4EzKHTGDCrX+MGj64KBtk1'
+  + 'msQuBAizQBVCVnUCbfVyDFQGncaA8YvXgPBFkAUIswB6MNASZAHCLECgJcgChFkA1Qq0BFmAMAvUItD+Zely95cEWSCXEwF3'
+  + 'GgMWrdKBpQxmAxrj/bVch7ObAFqzQDVN1jMtbdqycJtB9lGCLECYBarsXRrdEt4WFp6fBS3hfhedxw4C7KLTGMin/dhy1JEP'
+  + 'gNYsAKMXtFrcEuo2FhRitwfZNQRZgNYsUOc27XqNz3HNrbdi0Y4FaM0CNW3Tzmr+PU6uVuSy1j65LUH2VoIsQGsWqLP2lqXd'
+  + 'tmX7Ab5FIyh+gNYsUG+TOwKrK1czjK9latt3sY1wTpAFCLNAT3A6Qu0n5crVbUbSvk2uXH05cn0ACLNAD4TaRW1TPiFXrlZo'
+  + '31TpjdIyuXL1ibapTxNigUIPdL6bBQr2Ti0NmbNKX9d9ejEytF6l83VYyNwj9F8UL0CYBSBdpbsNpnaZ7qNIAcIsgHZTdF9o'
+  + '2zSODTpFyyhGoDz4bhYokx/pcDly5OiBRMvdq13lyNFYgixAaxZAwuNUf6obNEn9Gq+NkkaqT59rGb4RAGEWAIDeQ6cxAACE'
+  + 'WQAACLMAAIAwCwAAYRYAAMIsAAAgzAIAQJgFAIAwCwAACLMAABBmAQAgzAIAAMIsAACEWQAACLMAAIAwCwAAYRYAAMIsAAAg'
+  + 'zAIAQJgFAIAwCwAACLMAABBmAQAgzAIAAMIsAACEWQAACLMAAIAwCwAAYRYAABBmAQAgzAIAQJgFAACEWQAACLMAABBmAQAA'
+  + 'YRYAAMIsAACEWQAAQJgFAIAwCwAAYRYAABBmAQAgzAIAQJgFAACEWQAACLMAABBmAQAAYRYAAMIsAACEWQAAQJgFAIAwCwAA'
+  + 'YdakU3WP+uW2/Qxotv5WIyh4AEAvcFzTKQ5Tn/aO+dkP66vsAov8O9cpZa5yq+0VK9OgktpRr1tZ19H6z1LWluodY1WqzXlu'
+  + 'iVPafbBJCzVH365KmE2X2Pv1cOUPrGP1NGG2R8PsKxqdY0kt1+FW1rVRu5Y2zAaVw2StJswSZi3k/HL9k+kMmuo0PlJu6o19'
+  + 'SK6erEyQfSJw6hIu63vWKEvpzgycepilte1a2vK9KXDqKioerJgjV64eLF9r1szVxEn6XkXbsmW68qc1a/d6+hrNyqlU861p'
+  + '/rUdruUccbRme641u91W7Wgm7eyt2QFjG/lEgVU2u6u4DOwJdwVM2z/XHDxmIc3bA6YtL/meuILKCKuG6Q0zMSlra9Z8YCz3'
+  + 'bRebNbxCOac1a2Pr/fnfYuHe+f31Qo41zS1tfV6hQ0p9xNGarW9rdtAJWlxca3aklc1zdVKJw+xwLvF63sO51IoXCt7KW0tS'
+  + '2odQ4VCwJ7WxqDA7Sq9Ezl+uMXICfo7Syi4pf1dXV3Jn3E597AkfKzwHeXRSf6oUZX1Q5Ny5VEbkYtdsTcq0ncaO3gid1xfr'
+  + 'NNCniRFz36VnSljYbtdSKXt+q/okZLm2xJ+b4/X9HOvaBo01uq6/C2i7OhxxPXZcVvds4c/56C6NQL/TNbNrz0nq8kgbZsMW'
+  + 'e1TnJUhlvs6q1AFEmGVLwuqB2fys0oE51rTyfjPb7Ygbpm3UZsKswZz/uR43f9wNMVr5nURBVjo7Itvlu+u4e6fwZqEX3Gt9'
+  + 'DQcWvIVHl6Kc/67rJ7ZSGWHUv8uRoy0hc/vza83O0CcDpq7X+JQbNqAxgdP7cn5QIuuVdfmu/2jNVjU/3eraXUa/IS5rPane'
+  + 'EUdrti4531c/C5z+Xn0rn9ZsUJB9PHWQVej3TJMqeAAdJvSmqQbTOrXrJ64xuLZnK13uZ1Qux0M5WKzLHmZfDEnjm2kSSx5m'
+  + 'FwZMe0ynZyyU9amvZvOyLKBFcVmMT6GO1vimfNlg6v+W67Yc4ZsyrxRl7O+gu0Mf8E37VuXqzjYOnwLat+aCdYphPpN3Gtu6'
+  + 'XcK1dFVib8c5KntHC53Gthyk/7GYo86tHa3f+D6zX0inVn1qSRWPuCqXOJ3G1uJd0tbsdGuhMDiVvsp1QjDoYi94Pte1vaK/'
+  + '8U17wlDa+5a0hA+K/cmbqI6wZqeAaYn7LJO2Zv0fN/cM39TAjreyXlmfokWSdtKrlWuB05q1k6N7DF1iLdExObbigh4dKkMt'
+  + '8d8Y2Xi1SNCtKQ61mdastZwbeEVk9jDrWC2ucndglb1yEmbteVLHW8pT57bO0RUWS8Cf7sE5t9XrdMQRZuuYc3/6R2ppkgSS'
+  + 'dRrbLvZFgW3c4kW9C2RDrIsF1M0JOdc+/7HxBUvrK0OQvT5i3nqOOBQs4d35yVqzs3V57tcNZbim8udqt5abUsp7FUhrtnp5'
+  + '+rouzLEVd1TAoKblb1lVvV7Tmq1Wzg8L+DY20RqStWZP8U35aI9ezfwmcu7+Qi9aYCCNziD7tNUcf8835eFKljzPq8OezG9e'
+  + 'ThZm9/ZNudvwBgW906do9/um/Kjtv0/75r9AzewB/mc432NhLcdGzJuYOXX/K/zeX8rLlfZvwvzPyvK8OvJ1TqKwlqjTuD6d'
+  + 'kGa3ulpPHtZzH9QjV/7uqe0p+l/0vkkje7Rcq12z6TSuWs79Nzx+XRfZas3CyrUOamP3jMtHtcp+4puya8a1nVqjkudtz7Dn'
+  + 'Kd+U45MsTphNfqV0pW/Kn/imPErB9YCVvikPGl6D3e8cv+2bclwJSnXAN+Va35QLfVP+muoIa/x3Fo9LsnjWTuOR2tRzYdZJ'
+  + '/aly5r0+e6H6+XIjU7vdF0wezzSaeJVrbZXrNmeLquV8Z/02yzqytmZvqXmQjXsS87+fsE9AMv/eZf51vinvqV0ZnJV6SW6D'
+  + 'gi2vZls8WWs26M2w9b4Jyg24rvldZa4Fac3mn68sYyh1pvZXutNiOTzku4ljcY6DbsQv0SP0XwGfGxXwUB2tL1qztnKeaR3J'
+  + 'wuw0fannw6xToUpKmLVtns7tmLJNw4xtpX8bt/reVrqXXurRk73/k0MqMh4UYbZqOX+L1mVZR7JO43sCpu1W4yDrf/fHr0M/'
+  + '+1iMnY+6Oc83Jf1Luy+P8ZkdfFOer1V5+u8XXhP62cW+KW9QIWHFn2dbPPurA+rcnk12lVSFt8jQmi1vzlxfGDkh1/VVr/+l'
+  + 'qvWb1mzVcv7PvsFo1miSrdZssD/hYicEgy7Wn//VEaaeRj05cOoWQ6n7R1p6bw32xlQqJCzwj/j20ySLJw2zJwVM+381LdoV'
+  + 'vinR4736n6dl0MX6O9835duGUt4WOHWab8r/SZW6/x7lbxVelmt9U+ZEfv4035QvUyGRi1uTfNhJ/AVi8AJ17DhO3hVRtm4X'
+  + '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'
+  + 'XmvU5eS+xPiWuK7rft96CcwIaQvlHWaTHP1TQvNMnTTbK5KmN+v66DRNFOCMGNfpz7iu67rzu66tL8Xp7XbXdV13WeT6n7QY'
+  + 'aNOmHHe5WbHLd26Xtc3qmDYQcciPcl3XdQ/LtUwat7A9FvmZx7tegZs47WywEGbPin1yN1Gmt4Vcd7f+zOt65KTvX5KFVM2f'
+  + '1PMOsxe7ruu6I5od+qMS5GGVhTp5hKV+iagbGx+M/MzDruu67j2h81e4ruu698XI1VtzDLNdfhw3+oteJ/ZXwk6mT22fG/y5'
+  + 'qKXj59TmV+KOteVMlG/wfFfSvZqmqfqyb16/xmUo1XRlYm9L86iHWXNmtkxtl2WWbUmbatJ1Zj8zmD63tKaX/PinTprZI+nX'
+  + 'kHLtpoaneCzG3YqSYty/2diEjQnX/0iBdwBe2HH3nA0Pxyzft4TO3xIyfZqkr0iSbmubPi5Tfj+bokxGx9zSRl17s+W92qiH'
+  + 'zxpNs5HzP82hTjaei5wT87ip60hkD+RwZOapsZ9WGU3zCUlqPgdg03BJ0uMx62TUs923Vq5GZe4OWJDoO4ZVMda2IiDF8Nzc'
+  + 'n9uTsVm+DUhfwksSlW94l+QZvnRmtUzx58V1Xff+XMtkINGWrrDaabz9XsyRxp+4W5ZDB92GRGX5ZOJ1Tg25xS3blkzv0mGY'
+  + '9oYbtySdxo2vroa23YR2e6I8zE10boxfJ/tyKJ9kZ7L+iBK0+zVftifrLXUam+lcbp/n/6Sdzivzz1JJl+m+XLv1knUPLdWR'
+  + 'bf9v8p4EfFLHty07XXca6pqRpBv0eaMdUGa6hc3Ww3hbYKerNf+ytNPVGK+D8xHN1ViNlLRRw7RVX4pZCz+tWwruNO5MLc0Z'
+  + 'oLfrpJn9YaKbXZKu9PoBu3dDlDLMJqmQUd9XhHe8mLdRu7b897SOLWWY7SzTIc2pb0iapDVGq/Mq77HzhvVdhh4pX5ht/L9a'
+  + 'k0t0Suu0o17PuSx31y8lSStTD9kXlOoOek2StEinJCyB0XolQblFpZ9HmF3TMpxIujNAsmBdRJ3cQ7+qcZiVftE2iO8G7d6t'
+  + 'G7msrw5YV7nvTUbK0Xht8/47pnEfd6m0f38+qu0wcb0TZ6vVmdc4WY72aqY6Tq7cyBF7yunAUufu9Vz6alp/fulNPdRoqq95'
+  + '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'
+  + 'IVgG9u28EgAAAABJRU5ErkJggg==';
+
+const BRAND_MODE = String(process.env.BRAND_MODE || 'corner').toLowerCase();
+// Kept low on purpose. This sits in a dark bedroom for two hours; a bright
+// rectangle in the corner is the fastest way to lose a sleep viewer.
+const BRAND_OPACITY = clamp01(Number(process.env.BRAND_OPACITY ?? 0.32));
+const BRAND_MARGIN_PCT = clamp01(Number(process.env.BRAND_MARGIN_PCT ?? 0.04));
+const LOCKUP_PATH = path.join(os.tmpdir(), 'saltwater-lockup.png');
+
+let lockupReady = false;
+function ensureLockup() {
+  if (lockupReady) return true;
+  try {
+    fs.writeFileSync(LOCKUP_PATH, Buffer.from(LOCKUP_B64, 'base64'));
+    lockupReady = true;
+  } catch (err) {
+    // A missing mark is not worth failing a night's render over.
+    console.error('lockup write failed:', err.message);
+    lockupReady = false;
+  }
+  return lockupReady;
+}
+
+/**
+ * Extra ffmpeg inputs and the filter tail that puts the mark bottom-right.
+ *
+ * Returns the plain `format=yuv420p[v]` tail when branding is off, so callers
+ * can always append `brand.chain` and never branch.
+ */
+function brandOverlay(scale) {
+  const plain = { inputs: [], chain: ',format=yuv420p[v]' };
+  if (BRAND_MODE === 'off' || BRAND_OPACITY <= 0) return plain;
+  if (!ensureLockup()) return plain;
+
+  const parts = String(scale).split(':');
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w < 2 || h < 2) return plain;
+
+  // A vertical frame is half as wide, so the same percentage would render the
+  // mark unreadably small on a phone. Shorts get a proportionally larger one.
+  const isWide = w >= h;
+  const pct = Number(process.env.BRAND_WIDTH_PCT ?? (isWide ? 0.18 : 0.30));
+  const markW = Math.max(80, Math.round(w * clamp01(pct)));
+  const margin = Math.round(w * BRAND_MARGIN_PCT);
+  const op = BRAND_OPACITY.toFixed(3);
+
+  return {
+    inputs: ['-i', LOCKUP_PATH],
+    chain: '[base];'
+      + `[1:v]scale=${markW}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa=${op}[lg];`
+      + `[base][lg]overlay=W-w-${margin}:H-h-${margin}:eof_action=repeat,format=yuv420p[v]`,
+  };
+}
+
+function brandStatus() {
+  return {
+    mode: BRAND_MODE,
+    opacity: BRAND_OPACITY,
+    lockup: ensureLockup(),
+  };
+}
+
 // ------------------------------------------------------------- media makers
 
 /**
@@ -299,14 +565,16 @@ function startJob(kind, input, worker) {
  */
 async function buildLoop(rawPath, loopPath, scale, look) {
   const grade = gradeChain(look === undefined ? { dim: DEFAULT_DIM } : look);
+  const brand = brandOverlay(scale);
   const filter = [
     '[0:v]split[a][b];',
     '[a]trim=0:8,setpts=PTS-STARTPTS[main];',
     '[b]trim=8:10,setpts=PTS-STARTPTS[tail];',
-    `[main][tail]xfade=transition=fade:duration=1:offset=7,scale=${scale}:flags=lanczos${grade},format=yuv420p[v]`,
+    `[main][tail]xfade=transition=fade:duration=1:offset=7,scale=${scale}:flags=lanczos${grade}${brand.chain}`,
   ].join('');
   await ffmpeg([
     '-i', rawPath,
+    ...brand.inputs,
     '-filter_complex', filter,
     '-map', '[v]', '-an',
     '-c:v', 'libx264', '-preset', 'slow', '-crf', '26',
@@ -856,6 +1124,7 @@ app.get('/health', async (_req, res) => {
       youtube: Boolean(YT_CLIENT_ID && YT_CLIENT_SECRET && YT_REFRESH_TOKEN),
     },
     default_dim: DEFAULT_DIM,
+    brand: brandStatus(),
     host: os.hostname(),
   });
 });
@@ -963,38 +1232,62 @@ app.post('/jobs/import', (req, res) => {
  */
 app.post('/jobs/reloop', (req, res) => {
   const body = req.body || {};
-  const look = lookFrom({ dim: body.dim, vivid: body.vivid });
-  const job = startJob('reloop', { all: Boolean(body.all), slug: body.slug, look }, async (j) => {
+
+  // Three shapes, in order of specificity:
+  //   { groups: [{ slugs, dim|vivid }, ...] }  each group keeps its own look
+  //   { slugs: [...], dim }                    one look for the listed slugs
+  //   { slug } / { all: true }                 one clip, or the whole library
+  //
+  // `groups` exists because the library is not uniform: every clip was looped
+  // at the dim that suited it, and that value lives in n8n, not here. A single
+  // reloop-all would flatten fifteen carefully tuned night clips to one dial
+  // setting. Groups let the caller rebuild everything in one sequential job
+  // while each clip keeps the look it was given.
+  const groups = Array.isArray(body.groups) && body.groups.length
+    ? body.groups
+    : [{ slugs: body.slugs, dim: body.dim, vivid: body.vivid, all: body.all, slug: body.slug }];
+
+  const job = startJob('reloop', { groups: groups.length }, async (j) => {
     const files = await fsp.readdir(DIRS.visuals).catch(() => []);
-    const wanted = Array.isArray(body.slugs) && body.slugs.length
-      ? body.slugs.map(slugSafe).filter(Boolean)
-      : null;
-    const targets = files
-      .filter((f) => f.endsWith('.mp4'))
-      .map((f) => f.slice(0, -4))
-      .filter((s) => {
-        if (body.all) return true;
-        if (wanted) return wanted.indexOf(s) !== -1;
-        return s === slugSafe(body.slug);
-      });
-    if (!targets.length) throw new Error('no raw clips matched');
+    const available = files.filter((f) => f.endsWith('.mp4')).map((f) => f.slice(0, -4));
 
     const rebuilt = [];
-    for (const slug of targets) {
-      const isWide = slug.indexOf('-16x9-') !== -1;
-      const scale = isWide ? '1920:1080' : '1080:1920';
-      step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}`);
-      await buildLoop(
-        path.join(DIRS.visuals, `${slug}.mp4`),
-        path.join(DIRS.loops, `${slug}_loop.mp4`),
-        scale,
-        look,
-      );
-      rebuilt.push(slug);
+    const skipped = [];
+    for (const group of groups) {
+      const look = lookFrom({ dim: group.dim, vivid: group.vivid });
+      const wanted = Array.isArray(group.slugs) && group.slugs.length
+        ? group.slugs.map(slugSafe).filter(Boolean)
+        : null;
+      const targets = available.filter((s) => {
+        if (group.all) return true;
+        if (wanted) return wanted.indexOf(s) !== -1;
+        return s === slugSafe(group.slug);
+      });
+      if (wanted) {
+        for (const w of wanted) if (targets.indexOf(w) === -1) skipped.push(w);
+      }
+
+      for (const slug of targets) {
+        const isWide = slug.indexOf('-16x9-') !== -1;
+        const scale = isWide ? '1920:1080' : '1080:1920';
+        step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}`);
+        await buildLoop(
+          path.join(DIRS.visuals, `${slug}.mp4`),
+          path.join(DIRS.loops, `${slug}_loop.mp4`),
+          scale,
+          look,
+        );
+        rebuilt.push({ slug, dim: look.dim, vivid: look.vivid });
+      }
     }
+    if (!rebuilt.length) throw new Error('no raw clips matched');
+
     return {
-      rebuilt: rebuilt.length, slugs: rebuilt,
-      dim: look.dim, vivid: look.vivid,
+      rebuilt: rebuilt.length,
+      slugs: rebuilt.map((r) => r.slug),
+      detail: rebuilt,
+      skipped,
+      brand: brandStatus(),
       disk: await diskUsage(),
     };
   });
