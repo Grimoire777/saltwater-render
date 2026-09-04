@@ -1,0 +1,17 @@
+{
+  "name": "saltwater-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render service for the Saltwater YouTube pipeline: generates ambient loops and music beds, renders long-form sessions and Shorts with ffmpeg, and uploads to YouTube.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^140.0.1"
+  }
+}
