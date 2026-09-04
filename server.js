@@ -1654,6 +1654,31 @@ app.post('/jobs/audio', (_req, res) => {
  * step that would be glaring on still water is invisible in a snowstorm.
  */
 async function loopMotion(file) {
+  // Brightness first: the average luminance of the actual frames, 0-255.
+  // A sleep clip is watched in a dark bedroom, so this matters as much as
+  // motion does — a bright clip lights the room whatever else is right about
+  // it. Measured on the finished loop, so it includes the night grade.
+  let bright = null;
+  let brightP95 = null;
+  try {
+    const bs = await run('ffmpeg', [
+      '-hide_banner', '-nostats', '-i', file,
+      '-vf', 'scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+      '-f', 'null', '-',
+    ], { timeoutMs: 3 * 60 * 1000 });
+    const vals = [];
+    const rx = /lavfi\.signalstats\.YAVG=([\d.]+)/g;
+    let mm = rx.exec(bs.stderr);
+    while (mm) { vals.push(Number(mm[1])); mm = rx.exec(bs.stderr); }
+    if (vals.length) {
+      bright = Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1));
+      const sv = vals.slice().sort((a, b) => a - b);
+      brightP95 = Number(sv[Math.floor(sv.length * 0.95)].toFixed(1));
+    }
+  } catch (err) {
+    bright = null;
+  }
+
   const r = await run('ffmpeg', [
     '-hide_banner', '-nostats', '-i', file,
     '-vf', 'scale=320:-2,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG',
@@ -1704,14 +1729,28 @@ async function loopMotion(file) {
     else verdict = 'visible step';
   }
 
+  // Thresholds for a sleep clip, both judged on the finished graded loop:
+  //   motion   under 2.5 - anything brisker reads as activity, not drift
+  //   bright   under 55 of 255 - dark enough not to light a bedroom
+  const pace = mean < 1 ? 'very slow' : (mean < 2.5 ? 'slow' : (mean < 5 ? 'brisk' : 'fast'));
+  const level = bright === null ? 'unknown'
+    : (bright < 35 ? 'very dark' : (bright < 55 ? 'dark' : (bright < 80 ? 'bright' : 'very bright')));
+  const okMotion = mean < 2.5;
+  const okBright = bright !== null && bright < 55;
+
   return {
     duration_sec: Number(dur.toFixed(1)),
     motion: Number(mean.toFixed(2)),
     motion_p90: Number(p90.toFixed(2)),
+    brightness: bright,
+    brightness_p95: brightP95,
+    level,
     seam: seam === null ? null : Number(seam.toFixed(2)),
     seam_vs_motion: ratio,
     verdict,
-    pace: mean < 1 ? 'very slow' : (mean < 2.5 ? 'slow' : (mean < 5 ? 'brisk' : 'fast')),
+    pace,
+    sleep_ready: okMotion && okBright,
+    fails: [].concat(okMotion ? [] : ['too much motion']).concat(okBright ? [] : ['too bright']),
   };
 }
 
@@ -1733,10 +1772,19 @@ app.post('/jobs/loopcheck', (_req, res) => {
 
     const tooFast = loops.filter((l) => Number(l.motion) >= 2.5)
       .map((l) => ({ slug: l.slug, motion: l.motion, pace: l.pace }));
+    const tooBright = loops.filter((l) => Number(l.brightness) >= 55)
+      .map((l) => ({ slug: l.slug, brightness: l.brightness, level: l.level }));
     const stepping = loops.filter((l) => l.verdict === 'visible step')
       .map((l) => ({ slug: l.slug, seam_vs_motion: l.seam_vs_motion }));
+    const ready = loops.filter((l) => l.sleep_ready).map((l) => l.slug);
 
-    return { loops, too_fast_for_sleep: tooFast, visible_step: stepping };
+    return {
+      loops,
+      sleep_ready: ready,
+      too_fast_for_sleep: tooFast,
+      too_bright_for_sleep: tooBright,
+      visible_step: stepping,
+    };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
