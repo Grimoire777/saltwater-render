@@ -756,6 +756,12 @@ async function buildLoop(rawPath, loopPath, scale, look, motion) {
   const midEnd = (total - fade).toFixed(3);
   const tot = total.toFixed(3);
 
+  // Applied after the grade: a straight multiplier on luma, used by the
+  // auto-dim pass below to land a clip on a target brightness rather than on
+  // a guessed dim value.
+  const g = clampNum(motion && motion.lumaGain, 0.1, 1, 1);
+  const gainChain = g === 1 ? '' : `,lutyuv=y='clip(val*${g.toFixed(4)},16,235)'`;
+
   const filter = [
     `[0:v]${speed}split=3[h][m][t];`,
     `[h]trim=0:${f},setpts=PTS-STARTPTS[head];`,
@@ -763,7 +769,7 @@ async function buildLoop(rawPath, loopPath, scale, look, motion) {
     `[t]trim=${midEnd}:${tot},setpts=PTS-STARTPTS[tailseg];`,
     `[tailseg][head]xfade=transition=fade:duration=${f}:offset=0[blend];`,
     `[mid][blend]concat=n=2:v=1:a=0,`
-      + `scale=${scale}:flags=lanczos${grade}${brand.chain}`,
+      + `scale=${scale}:flags=lanczos${grade}${gainChain}${brand.chain}`,
   ].join('');
   await ffmpeg([
     '-i', rawPath,
@@ -1500,15 +1506,20 @@ app.post('/jobs/reloop', (req, res) => {
         const slowLabel = motion.slow && Number(motion.slow) !== 1
           ? `, ${Number(motion.slow).toFixed(2)}x slower` : '';
         step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}${slowLabel}`);
-        await buildLoop(
+        const bright = await buildLoopToTarget(
           path.join(DIRS.visuals, `${slug}.mp4`),
           path.join(DIRS.loops, `${slug}_loop.mp4`),
           scale,
           look,
           motion,
+          group.target_brightness,
         );
+        if (bright.corrected) {
+          step(j, `  dimmed ${slug} from ${bright.before} to ${bright.after}`);
+        }
         rebuilt.push({ slug, dim: look.dim, vivid: look.vivid,
-          slow: clampNum(motion.slow, 1, 4, 1), xfade: clampNum(motion.xfade, 0.5, 4, 1) });
+          slow: clampNum(motion.slow, 1, 4, 1), xfade: clampNum(motion.xfade, 0.5, 4, 1),
+          brightness: bright });
       }
     }
     if (!rebuilt.length) throw new Error('no raw clips matched');
@@ -1755,6 +1766,52 @@ async function loopMotion(file) {
 }
 
 /**
+ * Average luminance of a finished loop, 0-255.
+ */
+async function meanBrightness(file) {
+  try {
+    const r = await run('ffmpeg', [
+      '-hide_banner', '-nostats', '-i', file,
+      '-vf', 'scale=160:-2,signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+      '-f', 'null', '-',
+    ], { timeoutMs: 3 * 60 * 1000 });
+    const vals = [];
+    const rx = /lavfi\.signalstats\.YAVG=([\d.]+)/g;
+    let m = rx.exec(r.stderr);
+    while (m) { vals.push(Number(m[1])); m = rx.exec(r.stderr); }
+    if (!vals.length) return null;
+    return Number((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(1));
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Build a loop, then bring it to a target brightness if it lands above one.
+ *
+ * The dim dial was set by eye and never checked, and five night clips came out
+ * at 70-150 out of 255 while still being called "night". Guessing a bigger
+ * number would repeat the mistake, so this measures the finished loop and
+ * computes the exact luma gain needed, then rebuilds once with that gain.
+ *
+ * One correction pass, not a loop: luma gain is close enough to linear that a
+ * second pass buys almost nothing, and each pass costs a full re-encode.
+ */
+async function buildLoopToTarget(rawPath, loopPath, scale, look, motion, target) {
+  await buildLoop(rawPath, loopPath, scale, look, motion);
+  if (!target) return { target: null };
+
+  const before = await meanBrightness(loopPath);
+  if (before === null || before <= target) return { target, before, corrected: false };
+
+  const gain = clampNum(target / before, 0.1, 1, 1);
+  await buildLoop(rawPath, loopPath, scale, look,
+    Object.assign({}, motion, { lumaGain: gain }));
+  const after = await meanBrightness(loopPath);
+  return { target, before, after, luma_gain: Number(gain.toFixed(3)), corrected: true };
+}
+
+/**
  * Measure every loop on the volume. Read-only.
  */
 app.post('/jobs/loopcheck', (_req, res) => {
@@ -1785,6 +1842,109 @@ app.post('/jobs/loopcheck', (_req, res) => {
       too_bright_for_sleep: tooBright,
       visible_step: stepping,
     };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Integrated loudness of whatever comes out of a filter chain, in LUFS.
+ * Analysis only - decodes to null, encodes nothing.
+ */
+async function integratedAfter(file, chain) {
+  const af = chain ? `${chain},loudnorm=print_format=json` : 'loudnorm=print_format=json';
+  const r = await run('ffmpeg', ['-hide_banner', '-nostats', '-i', file,
+    '-af', af, '-f', 'null', '-'], { timeoutMs: 5 * 60 * 1000 });
+  const m = r.stderr.match(/\{[\s\S]*?"input_i"[\s\S]*?\}/);
+  if (!m) return null;
+  const v = Number(JSON.parse(m[0]).input_i);
+  return Number.isFinite(v) ? v : null;
+}
+
+/**
+ * Level out a music bed that swells.
+ *
+ * `tide` measured 9.5 LU of loudness range against 1.6-4.2 for the other five
+ * beds, with a passage at 0:18 sitting 5.7 dB above its own norm. A listener
+ * heard that as a wave crash loud enough to wake them. The bed is not bad, it
+ * is just too dynamic for something playing while someone sleeps.
+ *
+ * dynaudnorm rides the loud passages down without pulling the quiet ones up,
+ * which is what separates it from a compressor here - the aim is to shrink the
+ * range, not to make the bed louder.
+ *
+ * The original is kept as <slug>.orig.mp3 and never deleted, so a bad flatten
+ * can always be undone by hand. Re-run Audio Report afterwards to see whether
+ * the range actually came down.
+ */
+app.post('/jobs/flatten', (req, res) => {
+  const body = req.body || {};
+  const slugs = (Array.isArray(body.slugs) && body.slugs.length ? body.slugs : [body.slug])
+    .map(slugSafe).filter(Boolean);
+  if (!slugs.length) return res.status(400).json({ error: 'slug or slugs is required' });
+
+  // Gentle by default. A slow attack lets the shape of the music through and
+  // only rides down what sustains above the threshold.
+  const thresh = clampNum(body.threshold_db, -40, -6, -24);
+  const ratio = clampNum(body.ratio, 1.5, 20, 4);
+
+  const job = startJob('flatten', { slugs, thresh, ratio }, async (j) => {
+    const done = [];
+    for (const slug of slugs) {
+      const file = path.join(DIRS.tracks, `${slug}.mp3`);
+      if (!fs.existsSync(file)) { done.push({ slug, error: 'not found' }); continue; }
+
+      const orig = path.join(DIRS.tracks, `${slug}.orig.mp3`);
+      if (!fs.existsSync(orig)) await fsp.copyFile(file, orig);
+
+      step(j, `measuring ${slug} before`);
+      const before = await measureTrack(orig);
+
+      // A slow compressor with no makeup gain pulls the loud passages down and
+      // leaves the quiet ones alone. That is the whole job.
+      //
+      // dynaudnorm was the obvious tool and was wrong: it normalises toward a
+      // target, so it lifted the quiet parts instead, made the bed 6 dB louder
+      // overall, and left the range wider than it started. Measured, not
+      // assumed - it went from 12 LU to 14.8 LU.
+      //
+      // Compressing alone costs about 8 dB of level, so the second half of
+      // this is restoring exactly what the compressor took, measured on the
+      // compressed signal rather than guessed.
+      const comp = `acompressor=threshold=${thresh}dB:ratio=${ratio}`
+        + ':attack=100:release=2000:knee=6:makeup=1';
+
+      step(j, `measuring ${slug} after compression`);
+      const compLufs = await integratedAfter(orig, comp);
+      const makeup = (before.integrated_lufs !== null && compLufs !== null)
+        ? Number((before.integrated_lufs - compLufs).toFixed(2)) : 0;
+      const chain = makeup ? `${comp},volume=${makeup}dB` : comp;
+
+      const tmp = path.join(DIRS.tmp, `${slug}_flat.mp3`);
+      step(j, `flattening ${slug} (restoring ${makeup} dB)`);
+      await ffmpeg([
+        '-i', orig,
+        '-af', chain,
+        '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100',
+        tmp,
+      ], { timeoutMs: 10 * 60 * 1000 });
+
+      await fsp.rename(tmp, file);
+      step(j, `measuring ${slug} after`);
+      const after = await measureTrack(file);
+
+      done.push({
+        slug,
+        loudness_range_lu: { before: before.loudness_range_lu, after: after.loudness_range_lu },
+        sticks_out_db: {
+          before: before.transient ? before.transient.sticks_out_db : null,
+          after: after.transient ? after.transient.sticks_out_db : null,
+        },
+        integrated_lufs: { before: before.integrated_lufs, after: after.integrated_lufs },
+        makeup_db: makeup,
+        original_kept_at: `${slug}.orig.mp3`,
+      });
+    }
+    return { flattened: done };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
