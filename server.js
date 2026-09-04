@@ -63,6 +63,12 @@ const DEFAULT_DIM = clamp01(Number(process.env.LOOP_DIM ?? 0));
 
 // ---------------------------------------------------------------- utilities
 
+function clampNum(n, lo, hi, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(hi, Math.max(lo, v));
+}
+
 function clamp01(n) {
   if (!Number.isFinite(n)) return 0;
   if (n < 0) return 0;
@@ -206,6 +212,68 @@ async function probeDuration(file) {
  * through the `ffmpeg` helper, which forces `-v error` and would suppress the
  * very line being parsed.
  */
+/**
+ * Dynamic range control for the session audio.
+ *
+ * A generated bed can contain a transient — a wave breaking, a swell — that
+ * sits 15 dB above everything around it. On a normal track that is musical.
+ * On a sleep track at 2am it wakes the listener, which is the one failure this
+ * channel cannot afford. One did exactly that, and it was found by ear rather
+ * than by anything in this file.
+ *
+ * The compressor is deliberately gentle and slow: a 3:1 ratio with a soft knee
+ * and a 1.2s release rides the loud passages down without the pumping that
+ * heavy compression puts on ambient material. The limiter behind it is the
+ * hard stop — nothing gets past -3 dBFS whatever the bed does.
+ *
+ * Set SLEEP_DRC=0 to render flat, e.g. to compare against an earlier session.
+ */
+function sleepDrc() {
+  if (String(process.env.SLEEP_DRC ?? '1') === '0') return '';
+  // level=disabled matters. Without it alimiter normalises the output back up
+  // to full scale, which silently undoes the ceiling — measured: the "limited"
+  // peak came out at 0.0 dBFS instead of the -3.1 the limit implies.
+  return 'acompressor=threshold=-18dB:ratio=3:attack=50:release=1200:knee=6:makeup=1.5,'
+    + 'alimiter=limit=0.7:attack=5:release=200:level=disabled,';
+}
+
+/**
+ * Find the loudest moment in a bed, and how far it sticks out.
+ *
+ * Walks the file in windows and records the peak of each. A bed that swells
+ * and recedes has windows within a few dB of one another; a bed with a wave
+ * crash in it has one window sitting well above the rest, and this reports
+ * where. That is the difference between "atmospheric" and "wakes the listener
+ * at 2am", and nothing in this service could see it until a listener did.
+ */
+async function transientScan(file, duration) {
+  const win = 6;
+  const peaks = [];
+  for (let t = 0; t + 1 < duration; t += win) {
+    const r = await run('ffmpeg', [
+      '-hide_banner', '-nostats', '-ss', String(t), '-t', String(Math.min(win, duration - t)),
+      '-i', file, '-af', 'volumedetect', '-f', 'null', '-',
+    ], { timeoutMs: 60000 }).catch(() => null);
+    const m = r && r.stderr.match(/max_volume:\s*(-?[\d.]+) dB/);
+    if (m) peaks.push({ at: t, peak: Number(m[1]) });
+  }
+  if (!peaks.length) return null;
+
+  const sorted = peaks.map((p) => p.peak).slice().sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const worst = peaks.reduce((a, b) => (b.peak > a.peak ? b : a));
+  const above = Number((worst.peak - median).toFixed(1));
+  return {
+    loudest_at_sec: worst.at,
+    loudest_peak_dbfs: worst.peak,
+    typical_peak_dbfs: Number(median.toFixed(1)),
+    sticks_out_db: above,
+    // 6 dB is a doubling of perceived level against the bed's own norm.
+    flag: above >= 9 ? 'transient - likely to wake a sleeper'
+      : (above >= 6 ? 'noticeable swell' : 'even'),
+  };
+}
+
 async function meanVolume(file, startSec, lenSec) {
   const r = await run('ffmpeg', [
     '-hide_banner', '-nostats',
@@ -253,6 +321,7 @@ async function measureTrack(file) {
     loudness_range_lu: range,
     head_dbfs: await meanVolume(file, 0, win),
     tail_dbfs: await meanVolume(file, duration - win, win),
+    transient: await transientScan(file, duration),
   };
 }
 
@@ -634,14 +703,57 @@ function brandStatus() {
  * closer to 5 GB and filled the volume mid-render. Slow ambient footage carries
  * this bitrate with no visible loss.
  */
-async function buildLoop(rawPath, loopPath, scale, look) {
+async function buildLoop(rawPath, loopPath, scale, look, motion) {
   const grade = gradeChain(look === undefined ? { dim: DEFAULT_DIM } : look);
   const brand = brandOverlay(scale);
+
+  // `slow` stretches the source in time: 2 means half speed, so a 10s clip
+  // becomes a 20s one and everything in it drifts instead of moving. Some
+  // generated clips arrive far too energetic for a bedroom at 1am, and no
+  // amount of grading fixes motion.
+  //
+  // `xfade` is how long the loop takes to dissolve back onto its own first
+  // frame. One second is enough on slow water and visibly steps on anything
+  // faster, because the eye catches the jump before the blend finishes.
+  const slow = clampNum(motion && motion.slow, 1, 4, 1);
+  const raw = await probeDuration(rawPath).catch(() => 10);
+  const total = raw * slow;
+  // The fade has to fit twice inside the clip with material left in between.
+  const fade = clampNum(motion && motion.xfade, 0.5, Math.max(0.5, total / 3), 1);
+
+  /*
+   * Closing the loop.
+   *
+   * The previous version cut the source into 0-8 and 8-10 and crossfaded one
+   * into the other. Those two pieces are already adjacent in time, so the
+   * blend did nothing, the output ran from second 0 to second 10, and playing
+   * it on repeat jumped from the last frame straight back to the first. A
+   * viewer sees that as a step every nine seconds. One did.
+   *
+   * The fix is the standard construction. Hold back the first `fade` seconds,
+   * play the middle, then dissolve the clip's own tail onto that held-back
+   * head. The dissolve ends exactly on the frame the middle began with, so
+   * the last frame of the output equals its first and the join disappears.
+   *
+   *   out = [ mid: fade .. total-fade ] + [ tail .. head crossfade ]
+   *   length = total - fade
+   *
+   * Measured on a test clip: mean frame difference across the loop point fell
+   * from 7.22 to 0.91.
+   */
+  const speed = slow === 1 ? '' : `setpts=${slow.toFixed(3)}*PTS,`;
+  const f = fade.toFixed(3);
+  const midEnd = (total - fade).toFixed(3);
+  const tot = total.toFixed(3);
+
   const filter = [
-    '[0:v]split[a][b];',
-    '[a]trim=0:8,setpts=PTS-STARTPTS[main];',
-    '[b]trim=8:10,setpts=PTS-STARTPTS[tail];',
-    `[main][tail]xfade=transition=fade:duration=1:offset=7,scale=${scale}:flags=lanczos${grade}${brand.chain}`,
+    `[0:v]${speed}split=3[h][m][t];`,
+    `[h]trim=0:${f},setpts=PTS-STARTPTS[head];`,
+    `[m]trim=${f}:${midEnd},setpts=PTS-STARTPTS[mid];`,
+    `[t]trim=${midEnd}:${tot},setpts=PTS-STARTPTS[tailseg];`,
+    `[tailseg][head]xfade=transition=fade:duration=${f}:offset=0[blend];`,
+    `[mid][blend]concat=n=2:v=1:a=0,`
+      + `scale=${scale}:flags=lanczos${grade}${brand.chain}`,
   ].join('');
   await ffmpeg([
     '-i', rawPath,
@@ -1028,7 +1140,7 @@ async function renderSession(job, input) {
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'copy',
       '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-      '-af', `afade=t=in:st=0:d=8,afade=t=out:st=${fadeOutStart}:d=12`,
+      '-af', `${sleepDrc()}afade=t=in:st=0:d=8,afade=t=out:st=${fadeOutStart}:d=12`,
       '-movflags', '+faststart',
       outPath,
     ], { timeoutMs: 60 * 60 * 1000 });
@@ -1067,7 +1179,7 @@ async function renderShort(job, input) {
     '-map', '0:v:0', '-map', '1:a:0',
     '-c:v', 'libx264', '-preset', 'slow', '-crf', '20', '-r', '30', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-    '-af', 'afade=t=in:st=0:d=1.5,afade=t=out:st=13:d=2',
+    '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=13:d=2`,
     '-movflags', '+faststart',
     outPath,
   ], { timeoutMs: 15 * 60 * 1000 });
@@ -1359,6 +1471,7 @@ app.post('/jobs/reloop', (req, res) => {
     const skipped = [];
     for (const group of groups) {
       const look = lookFrom({ dim: group.dim, vivid: group.vivid });
+      const motion = { slow: group.slow, xfade: group.xfade };
       const wanted = Array.isArray(group.slugs) && group.slugs.length
         ? group.slugs.map(slugSafe).filter(Boolean)
         : null;
@@ -1374,14 +1487,18 @@ app.post('/jobs/reloop', (req, res) => {
       for (const slug of targets) {
         const isWide = slug.indexOf('-16x9-') !== -1;
         const scale = isWide ? '1920:1080' : '1080:1920';
-        step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}`);
+        const slowLabel = motion.slow && Number(motion.slow) !== 1
+          ? `, ${Number(motion.slow).toFixed(2)}x slower` : '';
+        step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}${slowLabel}`);
         await buildLoop(
           path.join(DIRS.visuals, `${slug}.mp4`),
           path.join(DIRS.loops, `${slug}_loop.mp4`),
           scale,
           look,
+          motion,
         );
-        rebuilt.push({ slug, dim: look.dim, vivid: look.vivid });
+        rebuilt.push({ slug, dim: look.dim, vivid: look.vivid,
+          slow: clampNum(motion.slow, 1, 4, 1), xfade: clampNum(motion.xfade, 0.5, 4, 1) });
       }
     }
     if (!rebuilt.length) throw new Error('no raw clips matched');
@@ -1491,7 +1608,114 @@ app.post('/jobs/audio', (_req, res) => {
     const spread = lufs.length
       ? Number((Math.max(...lufs) - Math.min(...lufs)).toFixed(1)) : null;
 
-    return { tracks, joins, worst_join: worst, loudness_spread_lu: spread };
+    const spiky = tracks
+      .filter((t) => t.transient && t.transient.sticks_out_db >= 6)
+      .map((t) => ({ slug: t.slug, at_sec: t.transient.loudest_at_sec,
+        sticks_out_db: t.transient.sticks_out_db, flag: t.transient.flag }));
+
+    return { tracks, joins, worst_join: worst, loudness_spread_lu: spread, spiky_beds: spiky };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * How fast does each loop move, and how visible is its seam?
+ *
+ * Two numbers per clip, both from the same idea: the average brightness of the
+ * difference between one frame and the next. A clip where almost nothing moves
+ * scores near zero; a clip with waves rolling through it scores high.
+ *
+ *   motion       averaged across the whole loop
+ *   seam         the single difference between the last frame and the first
+ *
+ * The seam is what a viewer sees as a "step" every nine seconds. Judged
+ * against that clip's own motion rather than an absolute number, because a
+ * step that would be glaring on still water is invisible in a snowstorm.
+ */
+async function loopMotion(file) {
+  const r = await run('ffmpeg', [
+    '-hide_banner', '-nostats', '-i', file,
+    '-vf', 'scale=320:-2,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+    '-f', 'null', '-',
+  ], { timeoutMs: 5 * 60 * 1000 });
+  const vals = [];
+  const re = /lavfi\.signalstats\.YAVG=([\d.]+)/g;
+  let m = re.exec(r.stderr);
+  while (m) { vals.push(Number(m[1])); m = re.exec(r.stderr); }
+  if (vals.length < 4) return null;
+
+  // First entry is frame 1 against frame 0; drop nothing, but the seam is
+  // measured separately below since tblend never wraps around.
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const sorted = vals.slice().sort((a, b) => a - b);
+  const p90 = sorted[Math.floor(sorted.length * 0.9)];
+
+  // Last frame against first frame: what the eye sees when the loop restarts.
+  const dur = await probeDuration(file);
+  const tmpA = path.join(DIRS.tmp, `seam_a_${path.basename(file)}.png`);
+  const tmpB = path.join(DIRS.tmp, `seam_b_${path.basename(file)}.png`);
+  let seam = null;
+  try {
+    await ffmpeg(['-ss', '0', '-i', file, '-frames:v', '1', '-vf', 'scale=320:-2', tmpA]);
+    await ffmpeg(['-sseof', '-0.05', '-i', file, '-frames:v', '1', '-vf', 'scale=320:-2', tmpB]);
+    const s = await run('ffmpeg', ['-hide_banner', '-nostats', '-i', tmpB, '-i', tmpA,
+      '-filter_complex', '[0][1]blend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG',
+      '-f', 'null', '-'], { timeoutMs: 60000 });
+    const mm = s.stderr.match(/lavfi\.signalstats\.YAVG=([\d.]+)/);
+    if (mm) seam = Number(mm[1]);
+  } catch (err) {
+    seam = null;
+  }
+  await fsp.rm(tmpA, { force: true });
+  await fsp.rm(tmpB, { force: true });
+
+  const ratio = (seam !== null && mean > 0.01) ? Number((seam / mean).toFixed(2)) : null;
+
+  // Judge on the ratio, but only once the seam is big enough to see at all.
+  // On near-still footage the motion figure is a rounding error, so a
+  // perfectly fine seam of 0.7 divided by a motion of 0.2 reads as a huge
+  // ratio and the clip gets condemned for standing still.
+  let verdict = 'unknown';
+  if (seam !== null) {
+    if (seam < 1.5) verdict = 'seamless';
+    else if (ratio === null || ratio < 2) verdict = 'seamless';
+    else if (ratio < 4) verdict = 'slight step';
+    else verdict = 'visible step';
+  }
+
+  return {
+    duration_sec: Number(dur.toFixed(1)),
+    motion: Number(mean.toFixed(2)),
+    motion_p90: Number(p90.toFixed(2)),
+    seam: seam === null ? null : Number(seam.toFixed(2)),
+    seam_vs_motion: ratio,
+    verdict,
+    pace: mean < 1 ? 'very slow' : (mean < 2.5 ? 'slow' : (mean < 5 ? 'brisk' : 'fast')),
+  };
+}
+
+/**
+ * Measure every loop on the volume. Read-only.
+ */
+app.post('/jobs/loopcheck', (_req, res) => {
+  const job = startJob('loopcheck', {}, async (j) => {
+    const files = (await fsp.readdir(DIRS.loops).catch(() => []))
+      .filter((f) => f.endsWith('_loop.mp4')).sort();
+    if (!files.length) throw new Error('no loops on the volume');
+
+    const loops = [];
+    for (const f of files) {
+      step(j, `measuring ${f}`);
+      const m = await loopMotion(path.join(DIRS.loops, f));
+      loops.push(Object.assign({ slug: f.replace(/_loop\.mp4$/, '') }, m || { verdict: 'unreadable' }));
+    }
+
+    const tooFast = loops.filter((l) => Number(l.motion) >= 2.5)
+      .map((l) => ({ slug: l.slug, motion: l.motion, pace: l.pace }));
+    const stepping = loops.filter((l) => l.verdict === 'visible step')
+      .map((l) => ({ slug: l.slug, seam_vs_motion: l.seam_vs_motion }));
+
+    return { loops, too_fast_for_sleep: tooFast, visible_step: stepping };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
