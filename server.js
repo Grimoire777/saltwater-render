@@ -510,7 +510,7 @@ app.use((_req, res) => res.status(404).json({ error: 'not found' }));
  
 ensureDirs()
   .then(() => {
-    app.listen(PORT, '0.0.0.0', () => {
+       app.listen(PORT, '::', () => {
       console.log(`saltwater render service listening on ${PORT}, data dir ${DATA_DIR}`);
     });
   })
