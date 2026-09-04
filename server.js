@@ -254,22 +254,32 @@ async function transientScan(file, duration) {
       '-hide_banner', '-nostats', '-ss', String(t), '-t', String(Math.min(win, duration - t)),
       '-i', file, '-af', 'volumedetect', '-f', 'null', '-',
     ], { timeoutMs: 60000 }).catch(() => null);
-    const m = r && r.stderr.match(/max_volume:\s*(-?[\d.]+) dB/);
-    if (m) peaks.push({ at: t, peak: Number(m[1]) });
+    // RMS, not peak. Peak barely moves across a piece of music — it is set by
+    // whatever transient happens to be loudest — so a swell that doubles the
+    // perceived volume can leave the peak almost unchanged. The first version
+    // of this scan measured peak, reported every bed as "even", and missed a
+    // passage a listener had already told me was too loud. RMS is what the ear
+    // is actually responding to.
+    const rms = r && r.stderr.match(/mean_volume:\s*(-?[\d.]+) dB/);
+    const pk = r && r.stderr.match(/max_volume:\s*(-?[\d.]+) dB/);
+    if (rms) peaks.push({ at: t, level: Number(rms[1]), peak: pk ? Number(pk[1]) : null });
   }
   if (!peaks.length) return null;
 
-  const sorted = peaks.map((p) => p.peak).slice().sort((a, b) => a - b);
+  const sorted = peaks.map((p) => p.level).slice().sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)];
-  const worst = peaks.reduce((a, b) => (b.peak > a.peak ? b : a));
-  const above = Number((worst.peak - median).toFixed(1));
+  const worst = peaks.reduce((a, b) => (b.level > a.level ? b : a));
+  const quiet = peaks.reduce((a, b) => (b.level < a.level ? b : a));
+  const above = Number((worst.level - median).toFixed(1));
   return {
     loudest_at_sec: worst.at,
-    loudest_peak_dbfs: worst.peak,
-    typical_peak_dbfs: Number(median.toFixed(1)),
+    loudest_rms_dbfs: worst.level,
+    quietest_rms_dbfs: quiet.level,
+    typical_rms_dbfs: Number(median.toFixed(1)),
+    swing_db: Number((worst.level - quiet.level).toFixed(1)),
     sticks_out_db: above,
-    // 6 dB is a doubling of perceived level against the bed's own norm.
-    flag: above >= 9 ? 'transient - likely to wake a sleeper'
+    // 6 dB is roughly a doubling of perceived level against the bed's own norm.
+    flag: above >= 9 ? 'loud passage - could wake a sleeper'
       : (above >= 6 ? 'noticeable swell' : 'even'),
   };
 }
@@ -1608,10 +1618,21 @@ app.post('/jobs/audio', (_req, res) => {
     const spread = lufs.length
       ? Number((Math.max(...lufs) - Math.min(...lufs)).toFixed(1)) : null;
 
+    // Two independent signals for "this bed has loud passages": how far its
+    // loudest stretch sits above its own norm, and its loudness range, which
+    // is the standard measure of how much a piece varies. Either one alone can
+    // miss; a bed that trips either is worth a listen.
     const spiky = tracks
-      .filter((t) => t.transient && t.transient.sticks_out_db >= 6)
-      .map((t) => ({ slug: t.slug, at_sec: t.transient.loudest_at_sec,
-        sticks_out_db: t.transient.sticks_out_db, flag: t.transient.flag }));
+      .filter((t) => (t.transient && t.transient.sticks_out_db >= 6)
+        || Number(t.loudness_range_lu) >= 6)
+      .map((t) => ({
+        slug: t.slug,
+        at_sec: t.transient ? t.transient.loudest_at_sec : null,
+        sticks_out_db: t.transient ? t.transient.sticks_out_db : null,
+        swing_db: t.transient ? t.transient.swing_db : null,
+        loudness_range_lu: t.loudness_range_lu,
+        flag: t.transient ? t.transient.flag : 'unknown',
+      }));
 
     return { tracks, joins, worst_join: worst, loudness_spread_lu: spread, spiky_beds: spiky };
   });
