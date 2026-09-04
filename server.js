@@ -27,6 +27,10 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const YT_CLIENT_ID = process.env.YT_CLIENT_ID || '';
 const YT_CLIENT_SECRET = process.env.YT_CLIENT_SECRET || '';
 const YT_REFRESH_TOKEN = process.env.YT_REFRESH_TOKEN || '';
+// Sessions are filed here on upload. Shorts are not — dropping a 15-second
+// clip into a sleep playlist means someone drifting off gets a hard cut.
+// A per-job `playlist_id` overrides this; empty means no filing at all.
+const YT_PLAYLIST_ID = process.env.YT_PLAYLIST_ID || '';
 const PEXELS_API_KEY = process.env.PEXELS_API_KEY || '';
 
 const DIRS = {
@@ -495,6 +499,10 @@ const BRAND_MODE = String(process.env.BRAND_MODE || 'corner').toLowerCase();
 // rectangle in the corner is the fastest way to lose a sleep viewer.
 const BRAND_OPACITY = clamp01(Number(process.env.BRAND_OPACITY ?? 0.32));
 const BRAND_MARGIN_PCT = clamp01(Number(process.env.BRAND_MARGIN_PCT ?? 0.04));
+// Bottom-LEFT by default. YouTube draws its own click-to-subscribe watermark in
+// the bottom-right of the player, and two marks stacked in one corner reads as
+// a mistake rather than a brand. Left corner for us, right corner for YouTube.
+const BRAND_CORNER = String(process.env.BRAND_CORNER || 'bl').toLowerCase();
 const LOCKUP_PATH = path.join(os.tmpdir(), 'saltwater-lockup.png');
 
 let lockupReady = false;
@@ -535,17 +543,21 @@ function brandOverlay(scale) {
   const margin = Math.round(w * BRAND_MARGIN_PCT);
   const op = BRAND_OPACITY.toFixed(3);
 
+  const x = BRAND_CORNER.indexOf('l') !== -1 ? `${margin}` : `W-w-${margin}`;
+  const y = BRAND_CORNER.indexOf('t') !== -1 ? `${margin}` : `H-h-${margin}`;
+
   return {
     inputs: ['-i', LOCKUP_PATH],
     chain: '[base];'
       + `[1:v]scale=${markW}:-1:flags=lanczos,format=rgba,colorchannelmixer=aa=${op}[lg];`
-      + `[base][lg]overlay=W-w-${margin}:H-h-${margin}:eof_action=repeat,format=yuv420p[v]`,
+      + `[base][lg]overlay=${x}:${y}:eof_action=repeat,format=yuv420p[v]`,
   };
 }
 
 function brandStatus() {
   return {
     mode: BRAND_MODE,
+    corner: BRAND_CORNER,
     opacity: BRAND_OPACITY,
     lockup: ensureLockup(),
   };
@@ -1060,7 +1072,39 @@ async function uploadToYouTube(job, file, meta) {
   const videoId = res && res.data && res.data.id;
   if (!videoId) throw new Error('YouTube returned no video id');
   step(job, `uploaded as ${videoId}`);
+
+  await addToPlaylist(job, youtube, videoId, meta.playlist_id);
   return videoId;
+}
+
+/**
+ * File the video in a playlist, if one is configured.
+ *
+ * Deliberately non-fatal. The upload is the thing that cost an hour of CPU and
+ * a night's work; a playlist that has been renamed, deleted, or had its id
+ * mistyped must not turn a published video into a failed run. A failure here
+ * is logged as a step and the job carries on.
+ */
+async function addToPlaylist(job, youtube, videoId, override) {
+  const playlistId = String(override || YT_PLAYLIST_ID || '').trim();
+  // 'none' is how a caller says "not this one" without unsetting the default.
+  if (!playlistId || playlistId === 'none') return null;
+  try {
+    await youtube.playlistItems.insert({
+      part: ['snippet'],
+      requestBody: {
+        snippet: {
+          playlistId,
+          resourceId: { kind: 'youtube#video', videoId },
+        },
+      },
+    });
+    step(job, `added to playlist ${playlistId}`);
+    return playlistId;
+  } catch (err) {
+    step(job, `playlist add failed (video is still published): ${err.message}`);
+    return null;
+  }
 }
 
 // ------------------------------------------------------------ housekeeping
@@ -1125,6 +1169,7 @@ app.get('/health', async (_req, res) => {
     },
     default_dim: DEFAULT_DIM,
     brand: brandStatus(),
+    playlist: YT_PLAYLIST_ID || null,
     host: os.hostname(),
   });
 });
@@ -1325,7 +1370,8 @@ app.post('/jobs/short', (req, res) => {
   }
   const job = startJob('short', { run_id: input.run_id, visual_slug: input.visual_slug }, async (j) => {
     const file = await renderShort(j, input);
-    const videoId = await uploadToYouTube(j, file, input);
+    // Shorts never go in the sessions playlist — see YT_PLAYLIST_ID.
+    const videoId = await uploadToYouTube(j, file, Object.assign({}, input, { playlist_id: 'none' }));
     await fsp.rm(file, { force: true });
     step(j, 'deleted local render after successful upload');
     return { video_id: videoId, disk: await diskUsage() };
