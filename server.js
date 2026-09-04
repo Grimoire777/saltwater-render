@@ -136,6 +136,24 @@ async function probeStreams(file) {
   return stdout.split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
+/**
+ * What kind of file is this? Stills and clips need different treatment, and a
+ * file extension is not evidence, so ask ffprobe. A still reports no usable
+ * duration; anything with real running time is treated as video.
+ */
+async function probeMedia(file) {
+  const { stdout } = await run('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=format_name,duration',
+    '-of', 'default=noprint_wrappers=1',
+    file,
+  ], { timeoutMs: 60000 });
+  const format = ((stdout.match(/format_name=(.*)/) || [])[1] || '').trim();
+  const duration = Number(((stdout.match(/duration=(.*)/) || [])[1] || '').trim());
+  const seconds = Number.isFinite(duration) ? duration : 0;
+  return { format, duration: seconds, isImage: seconds < 0.5 };
+}
+
 async function download(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download failed ${res.status} for ${url}`);
@@ -377,6 +395,110 @@ async function makeStockVisual(job, { slug, aspect, query, dim, exclude, page, m
     pexels_id: Number(video.id),
     credit: `${author} on Pexels`,
     credit_url: video.url || '',
+  };
+}
+
+/**
+ * Turn a still into ten seconds of slow movement.
+ *
+ * The zoom is palindromic — fully in at the midpoint, back out by the end —
+ * so the last frame matches the first and buildLoop's crossfade has nothing
+ * to hide. A one-way zoom would snap back visibly every ten seconds, which is
+ * exactly the kind of repeated jolt that wakes someone up.
+ *
+ * The source is scaled to double the target first: zoompan samples from the
+ * upscaled frame, which is what keeps a slow push from looking like it is
+ * stepping between pixels.
+ */
+async function stillToClip(srcPath, outPath, scale) {
+  const parts = scale.split(':');
+  const w = Number(parts[0]);
+  const h = Number(parts[1]);
+  const frames = 300; // 10s at 30fps
+  const filter = [
+    `scale=${w * 2}:${h * 2}:force_original_aspect_ratio=increase:flags=lanczos`,
+    `crop=${w * 2}:${h * 2}`,
+    `zoompan=z='1.045+0.045*cos(2*PI*on/${frames})':d=${frames}`
+      + `:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=30`,
+    'format=yuv420p',
+  ].join(',');
+  await ffmpeg([
+    '-i', srcPath,
+    '-vf', filter,
+    '-frames:v', String(frames),
+    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+    '-r', '30', '-pix_fmt', 'yuv420p',
+    outPath,
+  ], { timeoutMs: 15 * 60 * 1000 });
+}
+
+/**
+ * Bring in a visual from any URL — a clip or a still generated somewhere this
+ * service cannot call, then parked somewhere with a direct link.
+ *
+ * Produces exactly what makeVisual and makeStockVisual produce, so an imported
+ * asset is indistinguishable downstream: sessions, Shorts and /jobs/reloop all
+ * treat it the same. Short sources are looped up to ten seconds rather than
+ * rejected, because generators commonly hand back four or five.
+ */
+async function makeImportVisual(job, { slug, aspect, url, dim, start, source, credit }) {
+  const safe = slugSafe(slug);
+  const isWide = aspect === '16x9';
+  const scale = isWide ? '1920:1080' : '1080:1920';
+  const rawPath = path.join(DIRS.visuals, `${safe}.mp4`);
+  const loopPath = path.join(DIRS.loops, `${safe}_loop.mp4`);
+  const tmpPath = path.join(DIRS.tmp, `${safe}_import.bin`);
+
+  step(job, `downloading ${String(url).slice(0, 140)}`);
+  const bytes = await download(url, tmpPath);
+
+  const media = await probeMedia(tmpPath);
+  try {
+    if (media.isImage) {
+      step(job, `still (${media.format}) — building 10s slow zoom`);
+      await stillToClip(tmpPath, rawPath, scale);
+    } else if (media.duration >= 10.5) {
+      const startAt = Number.isFinite(Number(start))
+        ? Math.max(0, Number(start))
+        : Math.max(0, Math.floor((media.duration - 10) / 2));
+      step(job, `video ${media.duration.toFixed(1)}s — cutting 10s from ${startAt}s`);
+      await ffmpeg([
+        '-ss', String(startAt), '-i', tmpPath, '-t', '10', '-an',
+        '-vf', `scale=${scale}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scale}`,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-r', '30', '-pix_fmt', 'yuv420p',
+        rawPath,
+      ], { timeoutMs: 15 * 60 * 1000 });
+    } else {
+      step(job, `video only ${media.duration.toFixed(1)}s — repeating to fill 10s`);
+      await ffmpeg([
+        '-stream_loop', '-1', '-i', tmpPath, '-t', '10', '-an',
+        '-vf', `scale=${scale}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scale}`,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-r', '30', '-pix_fmt', 'yuv420p',
+        rawPath,
+      ], { timeoutMs: 15 * 60 * 1000 });
+    }
+  } finally {
+    await fsp.rm(tmpPath, { force: true });
+  }
+
+  const dimUsed = dim === undefined ? DEFAULT_DIM : clamp01(Number(dim));
+  step(job, `building seamless loop (dim ${dimUsed})`);
+  await buildLoop(rawPath, loopPath, scale, dimUsed);
+
+  const duration = await probeDuration(loopPath);
+  return {
+    slug: safe,
+    aspect,
+    file_path: rawPath,
+    loop_path: loopPath,
+    source_bytes: bytes,
+    loop_seconds: Number(duration.toFixed(2)),
+    dim: dimUsed,
+    kind: media.isImage ? 'still' : 'video',
+    source: source || 'import',
+    credit: credit || '',
   };
 }
 
@@ -737,6 +859,25 @@ app.post('/jobs/stock', (req, res) => {
   if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
   const job = startJob('stock', { slug, aspect, query }, (j) => makeStockVisual(j, {
     slug, aspect, query, dim, page, exclude, min_duration,
+  }));
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Import a visual from any direct URL — a clip or a still made somewhere this
+ * service cannot call. Drop the file anywhere with a direct link (a raw
+ * GitHub URL works) and pass it here.
+ *
+ * Body: { slug, aspect, url, dim?, start?, source?, credit? }
+ * "start" overrides where the 10s window is cut from; omit it and the middle
+ * of the clip is used, which is where stock and generated footage is calmest.
+ */
+app.post('/jobs/import', (req, res) => {
+  const { slug, aspect, url, dim, start, source, credit } = req.body || {};
+  if (!slug || !url) return res.status(400).json({ error: 'slug and url are required' });
+  if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
+  const job = startJob('import', { slug, aspect }, (j) => makeImportVisual(j, {
+    slug, aspect, url, dim, start, source, credit,
   }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
