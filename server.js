@@ -87,6 +87,70 @@ function nightGrade(dim) {
     + `,colorbalance=rs=${red}:bs=${blue}`;
 }
 
+/**
+ * Vivid grade — the opposite direction, for daytime relaxation and focus
+ * content, which is watched awake in a lit room.
+ *
+ * This is the hyper-real landscape look: saturation and contrast up, midtones
+ * lifted so shadows open rather than block up, a little unsharp for the
+ * micro-contrast that reads as "HDR", and a teal-orange split — cool shadows,
+ * warm highlights. Viewers now read this look as AI-generated even on real
+ * photographs, which is worth knowing but is not a reason to avoid it: it is
+ * simply what the top channels in that lane look like.
+ *
+ * The unsharp amount is kept low on purpose. Push it and you get halos on
+ * every horizon, and the extra high-frequency detail wrecks the bitrate cap
+ * the session render depends on.
+ */
+function vividGrade(vivid) {
+  const v = clamp01(vivid);
+  if (v === 0) return '';
+  const brightness = (0.02 * v).toFixed(3);
+  const contrast = (1 + 0.16 * v).toFixed(3);
+  const saturation = (1 + 0.45 * v).toFixed(3);
+  const gamma = (1 + 0.10 * v).toFixed(3);
+  const redHi = (0.06 * v).toFixed(3);
+  const blueHi = (-0.04 * v).toFixed(3);
+  const blueSh = (0.05 * v).toFixed(3);
+  const sharpen = (0.6 * v).toFixed(2);
+  return `,eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}:gamma=${gamma}`
+    + `,colorbalance=rh=${redHi}:bh=${blueHi}:bs=${blueSh}`
+    + `,unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount=${sharpen}`;
+}
+
+/**
+ * Pick the grade for a clip. The two directions are mutually exclusive — a
+ * clip is either being taken down for night or pushed up for day — so if a
+ * caller passes both, dim wins and vivid is ignored rather than the two
+ * fighting each other through the filter chain.
+ */
+function gradeChain(opts) {
+  const o = opts || {};
+  const dim = clamp01(Number(o.dim));
+  if (dim > 0) return nightGrade(dim);
+  return vividGrade(Number(o.vivid));
+}
+
+/**
+ * Resolve what a request asked for into a settled look. Asking for vivid and
+ * saying nothing about dim means vivid — otherwise LOOP_DIM would quietly
+ * override every day-pool request on a service configured for night.
+ */
+function lookFrom(opts) {
+  const o = opts || {};
+  const vivid = clamp01(Number(o.vivid));
+  const dimGiven = o.dim !== undefined && o.dim !== null;
+  const dim = dimGiven ? clamp01(Number(o.dim)) : undefined;
+  if (vivid > 0 && !dim) return { dim: 0, vivid };
+  return { dim: dim === undefined ? DEFAULT_DIM : dim, vivid: 0 };
+}
+
+function describeLook(look) {
+  if (look.dim > 0) return `dim ${look.dim}`;
+  if (look.vivid > 0) return `vivid ${look.vivid}`;
+  return 'ungraded';
+}
+
 async function ensureDirs() {
   for (const dir of Object.values(DIRS)) {
     await fsp.mkdir(dir, { recursive: true });
@@ -233,8 +297,8 @@ function startJob(kind, input, worker) {
  * closer to 5 GB and filled the volume mid-render. Slow ambient footage carries
  * this bitrate with no visible loss.
  */
-async function buildLoop(rawPath, loopPath, scale, dim) {
-  const grade = nightGrade(dim === undefined ? DEFAULT_DIM : dim);
+async function buildLoop(rawPath, loopPath, scale, look) {
+  const grade = gradeChain(look === undefined ? { dim: DEFAULT_DIM } : look);
   const filter = [
     '[0:v]split[a][b];',
     '[a]trim=0:8,setpts=PTS-STARTPTS[main];',
@@ -259,7 +323,7 @@ async function buildLoop(rawPath, loopPath, scale, dim) {
  * Nothing longer is pre-encoded: the session render loops this file with
  * -stream_loop and -c:v copy, which costs almost nothing.
  */
-async function makeVisual(job, { slug, aspect, prompt, dim }) {
+async function makeVisual(job, { slug, aspect, prompt, dim, vivid }) {
   const safe = slugSafe(slug);
   const isWide = aspect === '16x9';
   const scale = isWide ? '1920:1080' : '1080:1920';
@@ -286,12 +350,12 @@ async function makeVisual(job, { slug, aspect, prompt, dim }) {
   step(job, 'downloading clip (fal deletes results after ~1h)');
   const bytes = await download(url, rawPath);
 
-  const dimUsed = dim === undefined ? DEFAULT_DIM : clamp01(Number(dim));
-  step(job, `building seamless loop (dim ${dimUsed})`);
-  await buildLoop(rawPath, loopPath, scale, dimUsed);
+  const look = lookFrom({ dim, vivid });
+  step(job, `building seamless loop (${describeLook(look)})`);
+  await buildLoop(rawPath, loopPath, scale, look);
 
   const duration = await probeDuration(loopPath);
-  return { slug: safe, aspect, file_path: rawPath, loop_path: loopPath, source_bytes: bytes, loop_seconds: Number(duration.toFixed(2)), dim: dimUsed };
+  return { slug: safe, aspect, file_path: rawPath, loop_path: loopPath, source_bytes: bytes, loop_seconds: Number(duration.toFixed(2)), dim: look.dim, vivid: look.vivid };
 }
 
 /**
@@ -325,7 +389,7 @@ function pickStockFile(video, targetWidth, isWide) {
  * stored. That keeps the raw on disk to the same shape a fal clip has, which
  * is what lets /jobs/reloop retune a stock clip later without re-downloading.
  */
-async function makeStockVisual(job, { slug, aspect, query, dim, exclude, page, min_duration }) {
+async function makeStockVisual(job, { slug, aspect, query, dim, vivid, exclude, page, min_duration }) {
   if (!PEXELS_API_KEY) throw new Error('PEXELS_API_KEY is not set on the render service');
   const safe = slugSafe(slug);
   const isWide = aspect === '16x9';
@@ -377,9 +441,9 @@ async function makeStockVisual(job, { slug, aspect, query, dim, exclude, page, m
     await fsp.rm(tmpPath, { force: true });
   }
 
-  const dimUsed = dim === undefined ? DEFAULT_DIM : clamp01(Number(dim));
-  step(job, `building seamless loop (dim ${dimUsed})`);
-  await buildLoop(rawPath, loopPath, scale, dimUsed);
+  const look = lookFrom({ dim, vivid });
+  step(job, `building seamless loop (${describeLook(look)})`);
+  await buildLoop(rawPath, loopPath, scale, look);
 
   const duration = await probeDuration(loopPath);
   const author = (video.user && video.user.name) || 'Pexels';
@@ -390,7 +454,8 @@ async function makeStockVisual(job, { slug, aspect, query, dim, exclude, page, m
     loop_path: loopPath,
     source_bytes: bytes,
     loop_seconds: Number(duration.toFixed(2)),
-    dim: dimUsed,
+    dim: look.dim,
+    vivid: look.vivid,
     source: 'pexels',
     pexels_id: Number(video.id),
     credit: `${author} on Pexels`,
@@ -441,7 +506,7 @@ async function stillToClip(srcPath, outPath, scale) {
  * treat it the same. Short sources are looped up to ten seconds rather than
  * rejected, because generators commonly hand back four or five.
  */
-async function makeImportVisual(job, { slug, aspect, url, dim, start, source, credit }) {
+async function makeImportVisual(job, { slug, aspect, url, dim, vivid, start, source, credit }) {
   const safe = slugSafe(slug);
   const isWide = aspect === '16x9';
   const scale = isWide ? '1920:1080' : '1080:1920';
@@ -483,9 +548,9 @@ async function makeImportVisual(job, { slug, aspect, url, dim, start, source, cr
     await fsp.rm(tmpPath, { force: true });
   }
 
-  const dimUsed = dim === undefined ? DEFAULT_DIM : clamp01(Number(dim));
-  step(job, `building seamless loop (dim ${dimUsed})`);
-  await buildLoop(rawPath, loopPath, scale, dimUsed);
+  const look = lookFrom({ dim, vivid });
+  step(job, `building seamless loop (${describeLook(look)})`);
+  await buildLoop(rawPath, loopPath, scale, look);
 
   const duration = await probeDuration(loopPath);
   return {
@@ -495,7 +560,8 @@ async function makeImportVisual(job, { slug, aspect, url, dim, start, source, cr
     loop_path: loopPath,
     source_bytes: bytes,
     loop_seconds: Number(duration.toFixed(2)),
-    dim: dimUsed,
+    dim: look.dim,
+    vivid: look.vivid,
     kind: media.isImage ? 'still' : 'video',
     source: source || 'import',
     credit: credit || '',
@@ -838,10 +904,10 @@ app.get('/jobs/:id', (req, res) => {
 });
 
 app.post('/jobs/visual', (req, res) => {
-  const { slug, aspect, prompt, dim } = req.body || {};
+  const { slug, aspect, prompt, dim, vivid } = req.body || {};
   if (!slug || !prompt) return res.status(400).json({ error: 'slug and prompt are required' });
   if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
-  const job = startJob('visual', { slug, aspect }, (j) => makeVisual(j, { slug, aspect, prompt, dim }));
+  const job = startJob('visual', { slug, aspect }, (j) => makeVisual(j, { slug, aspect, prompt, dim, vivid }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
@@ -854,11 +920,11 @@ app.post('/jobs/visual', (req, res) => {
  * query do not keep landing on the same clip.
  */
 app.post('/jobs/stock', (req, res) => {
-  const { slug, aspect, query, dim, page, exclude, min_duration } = req.body || {};
+  const { slug, aspect, query, dim, vivid, page, exclude, min_duration } = req.body || {};
   if (!slug || !query) return res.status(400).json({ error: 'slug and query are required' });
   if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
   const job = startJob('stock', { slug, aspect, query }, (j) => makeStockVisual(j, {
-    slug, aspect, query, dim, page, exclude, min_duration,
+    slug, aspect, query, dim, vivid, page, exclude, min_duration,
   }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
@@ -873,46 +939,64 @@ app.post('/jobs/stock', (req, res) => {
  * of the clip is used, which is where stock and generated footage is calmest.
  */
 app.post('/jobs/import', (req, res) => {
-  const { slug, aspect, url, dim, start, source, credit } = req.body || {};
+  const { slug, aspect, url, dim, vivid, start, source, credit } = req.body || {};
   if (!slug || !url) return res.status(400).json({ error: 'slug and url are required' });
   if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
   const job = startJob('import', { slug, aspect }, (j) => makeImportVisual(j, {
-    slug, aspect, url, dim, start, source, credit,
+    slug, aspect, url, dim, vivid, start, source, credit,
   }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
 /**
  * Rebuild loops from raw clips already on disk, at the capped bitrate and the
- * current night grade. Costs nothing — no fal call — so it is also how you
- * retune the darkness of the whole library: {"all": true, "dim": 0.7}.
- * Omit "dim" to use LOOP_DIM. Pass {"all": true} to redo every raw clip.
+ * current grade. Costs nothing — no fal or Pexels call — so it is also how
+ * you retune the library.
+ *
+ * Pick the targets one of three ways: {"slug": "..."} for one clip,
+ * {"slugs": ["...", "..."]} for a named set, or {"all": true} for everything.
+ * Prefer "slugs" once the library has both pools in it — "all" applies one
+ * grade to every clip, which is how you would accidentally strip the night
+ * grade off the whole night pool while brightening the day pool.
+ *
+ * Grade with {"dim": 0.35} or {"vivid": 0.7}; omit both to use LOOP_DIM.
  */
 app.post('/jobs/reloop', (req, res) => {
   const body = req.body || {};
-  const dim = body.dim === undefined ? DEFAULT_DIM : clamp01(Number(body.dim));
-  const job = startJob('reloop', { all: Boolean(body.all), slug: body.slug, dim }, async (j) => {
+  const look = lookFrom({ dim: body.dim, vivid: body.vivid });
+  const job = startJob('reloop', { all: Boolean(body.all), slug: body.slug, look }, async (j) => {
     const files = await fsp.readdir(DIRS.visuals).catch(() => []);
+    const wanted = Array.isArray(body.slugs) && body.slugs.length
+      ? body.slugs.map(slugSafe).filter(Boolean)
+      : null;
     const targets = files
       .filter((f) => f.endsWith('.mp4'))
       .map((f) => f.slice(0, -4))
-      .filter((s) => (body.all ? true : s === slugSafe(body.slug)));
+      .filter((s) => {
+        if (body.all) return true;
+        if (wanted) return wanted.indexOf(s) !== -1;
+        return s === slugSafe(body.slug);
+      });
     if (!targets.length) throw new Error('no raw clips matched');
 
     const rebuilt = [];
     for (const slug of targets) {
       const isWide = slug.indexOf('-16x9-') !== -1;
       const scale = isWide ? '1920:1080' : '1080:1920';
-      step(j, `re-encoding ${slug} at capped bitrate, dim ${dim}`);
+      step(j, `re-encoding ${slug} at capped bitrate, ${describeLook(look)}`);
       await buildLoop(
         path.join(DIRS.visuals, `${slug}.mp4`),
         path.join(DIRS.loops, `${slug}_loop.mp4`),
         scale,
-        dim,
+        look,
       );
       rebuilt.push(slug);
     }
-    return { rebuilt: rebuilt.length, slugs: rebuilt, dim, disk: await diskUsage() };
+    return {
+      rebuilt: rebuilt.length, slugs: rebuilt,
+      dim: look.dim, vivid: look.vivid,
+      disk: await diskUsage(),
+    };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
