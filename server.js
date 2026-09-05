@@ -1101,6 +1101,97 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
 
 // ------------------------------------------------------------------ renders
 
+/**
+ * Build one seamless audio reel from the unique beds, and loop that instead of
+ * splicing beds end to end.
+ *
+ * The bug this exists to fix: every bed fades out to near-silence in its last
+ * seconds and starts at full level, and the concat demuxer splices with no
+ * overlap at all. Measured on the live beds:
+ *
+ *   drift ends at -73.3 dBFS, focus starts at -20.6  ->  a 52.7 dB step
+ *   hush  ends at -77.1 dBFS, sleep starts at -16.1  ->  a 61.0 dB step
+ *
+ * The sound dies away to nothing and then comes straight back. A listener
+ * hears that as a swell out of silence, and it lands every three minutes for
+ * the whole session. Jack heard it twice, at 6:00 and again at 42:00 — the
+ * same drift->focus join, two cycles apart.
+ *
+ * It stayed hidden for so long because integrated loudness across the beds is
+ * matched to 0.7 LU. Averages agree; it is only the seams that jump. Measuring
+ * the beds told us nothing — the fault was in the space between them.
+ *
+ * The fix is a crossfade rather than a splice: each bed is dissolved into the
+ * next over XFADE seconds, so the outgoing fade-out is covered by the incoming
+ * fade-in and the level never dips. Then the reel is closed into a loop the
+ * same way buildLoop closes video — hold back the head, play the middle,
+ * dissolve the tail onto the held-back head — so repeating the reel has no
+ * seam either. Every join in a two-hour session becomes a crossfade, including
+ * the ones between repeats.
+ *
+ * The curve is qsin, which is the equal-power crossfade. Measured on six test
+ * beds shaped like the real ones, the deepest remaining dip across a looped
+ * reel was 1.44 dB with qsin against 4.43 with the linear tri and 9.52 with
+ * esin. Uncorrelated material sums by power, not amplitude, so the linear
+ * curve leaves a hole in the middle of every dissolve. Against the 52.7 dB
+ * step this replaces, 1.44 dB over eight seconds is nothing.
+ */
+const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 2, 30, 8);
+
+async function buildBedReel(job, bedPaths, reelPath) {
+  const n = bedPaths.length;
+  if (n === 1) return bedPaths[0];
+
+  const inputs = [];
+  for (const p of bedPaths) inputs.push('-i', p);
+
+  // Chain the beds together, each dissolving into the next.
+  const parts = [];
+  let cur = '[0:a]';
+  for (let i = 1; i < n; i += 1) {
+    const out = i === n - 1 ? '[chained]' : `[x${i}]`;
+    parts.push(`${cur}[${i}:a]acrossfade=d=${BED_XFADE}:c1=qsin:c2=qsin${out}`);
+    cur = `[x${i}]`;
+  }
+
+  const chainPath = path.join(DIRS.tmp, `${path.basename(reelPath, '.m4a')}_chain.m4a`);
+  step(job, `crossfading ${n} beds at ${BED_XFADE}s`);
+  await ffmpeg([
+    ...inputs,
+    '-filter_complex', parts.join(';'),
+    '-map', '[chained]',
+    '-c:a', 'aac', '-b:a', '256k', '-ar', '44100', '-ac', '2',
+    chainPath,
+  ], { timeoutMs: 20 * 60 * 1000 });
+
+  // Close the reel into a loop, so the join between one repeat and the next is
+  // a crossfade too rather than the one hard splice we would have left behind.
+  const total = await probeDuration(chainPath);
+  const f = BED_XFADE;
+  if (!Number.isFinite(total) || total <= f * 3) {
+    step(job, 'reel too short to close; using the chain as-is');
+    await fsp.rename(chainPath, reelPath);
+    return reelPath;
+  }
+  const midEnd = (total - f).toFixed(3);
+  step(job, `closing the reel loop (${Math.round(total)}s)`);
+  await ffmpeg([
+    '-i', chainPath,
+    '-filter_complex',
+    `[0:a]asplit=3[h][m][t];`
+      + `[h]atrim=0:${f},asetpts=PTS-STARTPTS[head];`
+      + `[m]atrim=${f}:${midEnd},asetpts=PTS-STARTPTS[mid];`
+      + `[t]atrim=${midEnd}:${total.toFixed(3)},asetpts=PTS-STARTPTS[tailseg];`
+      + `[tailseg][head]acrossfade=d=${f}:c1=qsin:c2=qsin[blend];`
+      + `[mid][blend]concat=n=2:v=0:a=1[out]`,
+    '-map', '[out]',
+    '-c:a', 'aac', '-b:a', '256k', '-ar', '44100', '-ac', '2',
+    reelPath,
+  ], { timeoutMs: 20 * 60 * 1000 });
+  await fsp.rm(chainPath, { force: true });
+  return reelPath;
+}
+
 async function writeConcatList(listPath, files) {
   const body = files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
   await fsp.writeFile(listPath, `${body}\n`);
@@ -1168,19 +1259,28 @@ async function renderSession(job, input) {
   // How long each scene holds before cutting to the next one.
   const segment = Math.max(30, Number(input.segment_sec) || 300);
 
-  const audioListPath = path.join(DIRS.tmp, `${runId}_audio.txt`);
+  const reelPath = path.join(DIRS.tmp, `${runId}_reel.m4a`);
   const videoListPath = path.join(DIRS.tmp, `${runId}_video.txt`);
   const outPath = path.join(DIRS.renders, `${runId}.mp4`);
-  await writeConcatList(audioListPath, tracks);
+
+  // The caller sends the bed sequence already repeated out to session length.
+  // The reel repeats itself, so only the distinct beds are needed, in the order
+  // they first appear.
+  const uniqueBeds = [];
+  for (const t of tracks) { if (uniqueBeds.indexOf(t) === -1) uniqueBeds.push(t); }
+  await buildBedReel(job, uniqueBeds, reelPath);
+  const reelSeconds = await probeDuration(reelPath).catch(() => 0);
+
   const plan = await buildVideoList(videoListPath, loops, duration, segment);
 
   const fadeOutStart = Math.max(0, duration - 12);
   step(job, `rendering ${Math.round(duration / 60)} min session from ${loops.length} `
-    + `visual(s) in ${plan.segments} segments of ${segment}s, ${tracks.length} beds`);
+    + `visual(s) in ${plan.segments} segments of ${segment}s, `
+    + `${uniqueBeds.length} beds on a ${Math.round(reelSeconds)}s seamless reel`);
   try {
     await ffmpeg([
       '-f', 'concat', '-safe', '0', '-i', videoListPath,
-      '-f', 'concat', '-safe', '0', '-i', audioListPath,
+      '-stream_loop', '-1', '-i', reelPath,
       '-t', String(duration),
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'copy',
@@ -1193,11 +1293,11 @@ async function renderSession(job, input) {
     // A failed render leaves a partial file that can be gigabytes. Without this
     // the volume fills up and every subsequent night fails too.
     await fsp.rm(outPath, { force: true });
-    await fsp.rm(audioListPath, { force: true });
+    await fsp.rm(reelPath, { force: true });
     await fsp.rm(videoListPath, { force: true });
     throw err;
   }
-  await fsp.rm(audioListPath, { force: true });
+  await fsp.rm(reelPath, { force: true });
   await fsp.rm(videoListPath, { force: true });
 
   await verify(job, outPath, duration);
@@ -1574,10 +1674,21 @@ app.post('/jobs/track', (req, res) => {
 
 app.post('/jobs/session', (req, res) => {
   const input = req.body || {};
-  if (!input.run_id || !input.visual_slug || !input.duration_sec) {
-    return res.status(400).json({ error: 'run_id, visual_slug and duration_sec are required' });
+  // Either shape is valid. visual_slugs is current; visual_slug is the older
+  // single-scene form and renderSession still accepts it. This guard only
+  // checked the singular, so a caller sending the current shape got a 400
+  // telling it to send a field the renderer does not need — invisible for
+  // months because WF-A happens to send both.
+  const hasVisual = Boolean(input.visual_slug)
+    || (Array.isArray(input.visual_slugs) && input.visual_slugs.length > 0);
+  if (!input.run_id || !hasVisual || !input.duration_sec) {
+    return res.status(400).json({
+      error: 'run_id, duration_sec and one of visual_slug / visual_slugs are required',
+    });
   }
-  const job = startJob('session', { run_id: input.run_id, visual_slug: input.visual_slug }, async (j) => {
+  const label = input.visual_slug
+    || (Array.isArray(input.visual_slugs) ? input.visual_slugs[0] : '');
+  const job = startJob('session', { run_id: input.run_id, visual_slug: label }, async (j) => {
     const file = await renderSession(j, input);
     const videoId = await uploadToYouTube(j, file, input);
     await fsp.rm(file, { force: true });
