@@ -1099,6 +1099,57 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
   return { slug: safe, file_path: outPath, duration_sec: Math.round(duration) };
 }
 
+/**
+ * Bring in a bed from any URL — a field recording, or a piece made somewhere
+ * this service cannot call.
+ *
+ * The visual side has had /jobs/import since the start; the audio side never
+ * did, so every bed in the library had to come from ElevenLabs. That was fine
+ * while all six were generated and is not fine the moment a real recording is
+ * the right answer for a video.
+ *
+ * Normalised to -16 LUFS like every generated bed, so it sits level with the
+ * rest of the library and nothing has to be re-balanced around it. Forced to
+ * stereo because a mono source would otherwise play only on one side of the
+ * render's stereo pair.
+ */
+async function makeImportTrack(job, { slug, url, mood }) {
+  const safe = slugSafe(slug);
+  const tmpPath = path.join(DIRS.tmp, `${safe}_import.bin`);
+  const outPath = path.join(DIRS.tracks, `${safe}.mp3`);
+
+  step(job, `downloading ${String(url).slice(0, 140)}`);
+  const bytes = await download(url, tmpPath);
+
+  try {
+    const before = await measureTrack(tmpPath);
+    step(job, `source ${before.duration_sec}s at ${before.integrated_lufs} LUFS`
+      + ` — normalising to -16`);
+    await ffmpeg([
+      '-i', tmpPath,
+      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-ac', '2', '-ar', '44100',
+      '-c:a', 'libmp3lame', '-b:a', '192k',
+      outPath,
+    ], { timeoutMs: 10 * 60 * 1000 });
+  } finally {
+    await fsp.rm(tmpPath, { force: true });
+  }
+
+  const after = await measureTrack(outPath);
+  return {
+    slug: safe,
+    mood: mood || 'imported',
+    file_path: outPath,
+    source_bytes: bytes,
+    duration_sec: Math.round(after.duration_sec),
+    integrated_lufs: after.integrated_lufs,
+    loudness_range_lu: after.loudness_range_lu,
+    head_dbfs: after.head_dbfs,
+    tail_dbfs: after.tail_dbfs,
+  };
+}
+
 // ------------------------------------------------------------------ renders
 
 /**
@@ -1783,6 +1834,21 @@ app.post('/jobs/track', (req, res) => {
   const { slug, prompt, length_ms } = req.body || {};
   if (!slug || !prompt) return res.status(400).json({ error: 'slug and prompt are required' });
   const job = startJob('track', { slug }, (j) => makeTrack(j, { slug, prompt, length_ms }));
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Import a bed from any direct URL — the audio counterpart of /jobs/import.
+ * Drop the file anywhere with a direct link (a raw GitHub URL works) and pass
+ * it here. Normalised to -16 LUFS and forced to stereo so it sits alongside
+ * the generated beds without anything else needing to change.
+ *
+ * Body: { slug, url, mood? }
+ */
+app.post('/jobs/importtrack', (req, res) => {
+  const { slug, url, mood } = req.body || {};
+  if (!slug || !url) return res.status(400).json({ error: 'slug and url are required' });
+  const job = startJob('importtrack', { slug }, (j) => makeImportTrack(j, { slug, url, mood }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
