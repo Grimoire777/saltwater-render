@@ -1129,14 +1129,85 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
  * seam either. Every join in a two-hour session becomes a crossfade, including
  * the ones between repeats.
  *
- * The curve is qsin, which is the equal-power crossfade. Measured on six test
- * beds shaped like the real ones, the deepest remaining dip across a looped
- * reel was 1.44 dB with qsin against 4.43 with the linear tri and 9.52 with
- * esin. Uncorrelated material sums by power, not amplitude, so the linear
- * curve leaves a hole in the middle of every dissolve. Against the 52.7 dB
- * step this replaces, 1.44 dB over eight seconds is nothing.
+ * The curve is qsin, the equal-power crossfade: uncorrelated material sums by
+ * power, not amplitude, so a linear fade leaves a hole in the middle of every
+ * dissolve.
+ *
+ * The crossfade is deliberately SHORT, and that took a second listener report
+ * to get right. The first version dissolved over eight seconds without
+ * trimming, which cured the level step and replaced it with a different fault:
+ * for eight seconds two unrelated pieces of music play at once, in different
+ * keys. Jack heard that at 14:12 — the tide-into-hush join — and called it
+ * annoying rather than startling, which is exactly the difference between a
+ * harmonic clash and a level jump.
+ *
+ * Trimming the fades first is what makes a short dissolve possible, because
+ * both edges are then at full level. Measured across a looped reel of test
+ * beds shaped like the real ones:
+ *
+ *   hard splice                    31.27 dB dip, no overlap
+ *   8s crossfade, untrimmed         4.47 dB dip, 8s of two beds at once
+ *   3s crossfade, fades trimmed     0.46 dB dip, 3s of two beds at once
+ *
+ * Both faults at once, which is the point: neither a dip nor a lingering
+ * overlap. BED_XFADE tunes it if three seconds still reads as too much.
  */
-const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 2, 30, 8);
+const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 1, 30, 3);
+
+/**
+ * Find where a bed's sustained material actually starts and stops.
+ *
+ * Every bed is written with its own fade-in and fade-out, and those fades are
+ * the whole reason the joins were a problem. Crossfading over them does not
+ * help: the outgoing fade and the incoming fade are both already dropping, so
+ * the dissolve happens across two ramps and still dips. Cutting them off first
+ * means the crossfade joins two passages that are each at full level, and the
+ * dissolve can then be short.
+ *
+ * Reads the RMS envelope in one pass, buckets it per second, and walks in from
+ * each end until the level is within 3 dB of the bed's own typical level. The
+ * trim is capped so a bed with a genuinely quiet opening is not gutted.
+ */
+async function sustainedEdges(file) {
+  const DROP_DB = 3;
+  const MAX_TRIM = 20;
+  const r = await run('ffmpeg', [
+    '-hide_banner', '-nostats', '-i', file,
+    '-af', 'astats=metadata=1:reset=1,'
+      + 'ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
+    '-f', 'null', '-',
+  ], { timeoutMs: 5 * 60 * 1000 }).catch(() => null);
+  if (!r) return null;
+
+  const buckets = new Map();
+  let sec = null;
+  for (const line of r.stdout.split('\n')) {
+    const p = line.match(/pts_time:([\d.]+)/);
+    if (p) { sec = Math.floor(Number(p[1])); continue; }
+    const v = line.match(/RMS_level=(-?[\d.]+|-inf)/);
+    if (v && sec !== null) {
+      const db = v[1] === '-inf' ? -120 : Number(v[1]);
+      if (!buckets.has(sec) || db > buckets.get(sec)) buckets.set(sec, db);
+    }
+  }
+  const secs = [...buckets.keys()].sort((a, b) => a - b);
+  if (secs.length < 20) return null;
+  const levels = secs.map((s) => buckets.get(s));
+  const sorted = levels.slice().sort((a, b) => a - b);
+  const typical = sorted[Math.floor(sorted.length / 2)];
+  const floorDb = typical - DROP_DB;
+
+  let head = 0;
+  while (head < levels.length && levels[head] < floorDb) head += 1;
+  let tail = levels.length - 1;
+  while (tail > head && levels[tail] < floorDb) tail -= 1;
+  if (tail - head < levels.length / 2) return null; // implausible; leave it alone
+
+  return {
+    start: Math.min(head, MAX_TRIM),
+    end: levels.length - Math.min(levels.length - 1 - tail, MAX_TRIM),
+  };
+}
 
 async function buildBedReel(job, bedPaths, reelPath) {
   const n = bedPaths.length;
@@ -1145,12 +1216,28 @@ async function buildBedReel(job, bedPaths, reelPath) {
   const inputs = [];
   for (const p of bedPaths) inputs.push('-i', p);
 
-  // Chain the beds together, each dissolving into the next.
+  // Trim each bed back to its sustained region before anything else.
   const parts = [];
-  let cur = '[0:a]';
+  const labels = [];
+  let trimmed = 0;
+  for (let i = 0; i < n; i += 1) {
+    const e = await sustainedEdges(bedPaths[i]);
+    const label = `[t${i}]`;
+    labels.push(label);
+    if (e && (e.start > 0 || e.end > 0)) {
+      parts.push(`[${i}:a]atrim=${e.start}:${e.end},asetpts=PTS-STARTPTS${label}`);
+      trimmed += 1;
+    } else {
+      parts.push(`[${i}:a]anull${label}`);
+    }
+  }
+  if (trimmed) step(job, `trimmed the built-in fades off ${trimmed} of ${n} beds`);
+
+  // Chain the beds together, each dissolving into the next.
+  let cur = labels[0];
   for (let i = 1; i < n; i += 1) {
     const out = i === n - 1 ? '[chained]' : `[x${i}]`;
-    parts.push(`${cur}[${i}:a]acrossfade=d=${BED_XFADE}:c1=qsin:c2=qsin${out}`);
+    parts.push(`${cur}${labels[i]}acrossfade=d=${BED_XFADE}:c1=qsin:c2=qsin${out}`);
     cur = `[x${i}]`;
   }
 
