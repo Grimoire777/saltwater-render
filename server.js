@@ -1151,6 +1151,21 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
  *
  * Both faults at once, which is the point: neither a dip nor a lingering
  * overlap. BED_XFADE tunes it if three seconds still reads as too much.
+ *
+ * And three seconds still read as too much. Jack caught the same tide-into-hush
+ * join again at 13:41 — the reel had shortened from 1032s to 992s, and 14:12
+ * scaled by that ratio is 13:39, so it was the same seam moved, not a new one.
+ * Two unrelated pieces of music cannot be joined invisibly; a shorter dissolve
+ * only makes the clash briefer.
+ *
+ * So the pipeline now sends ONE bed per session. A bed crossfaded into itself
+ * is in its own key by definition, so the loop close has nothing to clash with,
+ * and a two-hour session has no bed-to-bed transitions at all. The six beds
+ * become six different-sounding videos rather than six textures fighting inside
+ * every video — the same reasoning that put one picture in each session.
+ *
+ * The trim and the loop close still matter for a single bed: spliced against
+ * itself, its own fade-out would run straight into its own fade-in.
  */
 const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 1, 30, 3);
 
@@ -1211,8 +1226,6 @@ async function sustainedEdges(file) {
 
 async function buildBedReel(job, bedPaths, reelPath) {
   const n = bedPaths.length;
-  if (n === 1) return bedPaths[0];
-
   const inputs = [];
   for (const p of bedPaths) inputs.push('-i', p);
 
@@ -1233,7 +1246,13 @@ async function buildBedReel(job, bedPaths, reelPath) {
   }
   if (trimmed) step(job, `trimmed the built-in fades off ${trimmed} of ${n} beds`);
 
-  // Chain the beds together, each dissolving into the next.
+  // Chain the beds together, each dissolving into the next. With a single bed
+  // there is nothing to chain — but it still goes through the loop close
+  // below, because a lone bed spliced against itself has exactly the same
+  // fade-out-into-fade-in problem as two different ones.
+  if (n === 1) {
+    parts.push(`${labels[0]}anull[chained]`);
+  }
   let cur = labels[0];
   for (let i = 1; i < n; i += 1) {
     const out = i === n - 1 ? '[chained]' : `[x${i}]`;
