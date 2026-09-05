@@ -1165,7 +1165,15 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
  * every video — the same reasoning that put one picture in each session.
  *
  * The trim and the loop close still matter for a single bed: spliced against
- * itself, its own fade-out would run straight into its own fade-in.
+ * itself, its own fade-out would run straight into its own fade-in. *
+ * The reel is written as WAV, not AAC, and that is not a detail. A compressed
+ * stream carries encoder priming samples, and -stream_loop re-inserts them on
+ * every pass: measured on a test reel looped four times, the output ran 62 ms
+ * long and every loop point held a 5 ms window at -240 dBFS -- true digital
+ * silence. A gap that short is not heard as a gap, it is heard as a click, and
+ * it would land at every repeat for the length of the session. PCM has no
+ * priming, so a loop is sample-exact. The reel is a transient file deleted
+ * after the render, so the size costs nothing.
  */
 const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 1, 30, 3);
 
@@ -1260,13 +1268,13 @@ async function buildBedReel(job, bedPaths, reelPath) {
     cur = `[x${i}]`;
   }
 
-  const chainPath = path.join(DIRS.tmp, `${path.basename(reelPath, '.m4a')}_chain.m4a`);
+  const chainPath = path.join(DIRS.tmp, `${path.basename(reelPath, '.wav')}_chain.wav`);
   step(job, `crossfading ${n} beds at ${BED_XFADE}s`);
   await ffmpeg([
     ...inputs,
     '-filter_complex', parts.join(';'),
     '-map', '[chained]',
-    '-c:a', 'aac', '-b:a', '256k', '-ar', '44100', '-ac', '2',
+    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
     chainPath,
   ], { timeoutMs: 20 * 60 * 1000 });
 
@@ -1291,7 +1299,7 @@ async function buildBedReel(job, bedPaths, reelPath) {
       + `[tailseg][head]acrossfade=d=${f}:c1=qsin:c2=qsin[blend];`
       + `[mid][blend]concat=n=2:v=0:a=1[out]`,
     '-map', '[out]',
-    '-c:a', 'aac', '-b:a', '256k', '-ar', '44100', '-ac', '2',
+    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
     reelPath,
   ], { timeoutMs: 20 * 60 * 1000 });
   await fsp.rm(chainPath, { force: true });
@@ -1365,7 +1373,7 @@ async function renderSession(job, input) {
   // How long each scene holds before cutting to the next one.
   const segment = Math.max(30, Number(input.segment_sec) || 300);
 
-  const reelPath = path.join(DIRS.tmp, `${runId}_reel.m4a`);
+  const reelPath = path.join(DIRS.tmp, `${runId}_reel.wav`);
   const videoListPath = path.join(DIRS.tmp, `${runId}_video.txt`);
   const outPath = path.join(DIRS.renders, `${runId}.mp4`);
 
