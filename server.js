@@ -302,6 +302,51 @@ async function meanVolume(file, startSec, lenSec) {
  * concatenates beds with a hard cut. A four-second window rather than an
  * instant, so a single quiet moment does not masquerade as a level change.
  */
+/**
+ * Spectral flatness — the one measurement that separates music from noise.
+ *
+ * Every other number in this service is a level: how loud, how much range,
+ * how big a step at a join. None of them can tell a pad from a hiss, which is
+ * exactly why two beds that were noise textures rather than music sat in
+ * rotation for weeks passing every check while ruining every video they
+ * appeared in.
+ *
+ * Flatness is the ratio of the geometric to the arithmetic mean of the power
+ * spectrum. A tone concentrates its energy in a few bins and scores near zero;
+ * noise spreads energy evenly and scores near one. Measured on this pipeline:
+ * a sine 0.004, brown noise 0.44, white noise 0.85, a real music bed about
+ * 0.04, and the two beds that had to be retired about 0.65.
+ *
+ * Returns the mean across the file, or null if the filter is unavailable —
+ * a missing measurement must never fail a render.
+ */
+async function spectralFlatness(file) {
+  try {
+    const r = await run('ffmpeg', [
+      '-hide_banner', '-nostats', '-i', file,
+      '-af', 'aspectralstats=measure=flatness,'
+        + 'ametadata=print:key=lavfi.aspectralstats.1.flatness:file=-',
+      '-f', 'null', '-',
+    ], { timeoutMs: 5 * 60 * 1000 });
+    const hits = String(r.stdout || '').match(/flatness=([0-9.eE+-]+)/g) || [];
+    if (!hits.length) return null;
+    let sum = 0;
+    let n = 0;
+    for (const h of hits) {
+      const v = Number(h.split('=')[1]);
+      if (Number.isFinite(v)) { sum += v; n += 1; }
+    }
+    return n ? Number((sum / n).toFixed(4)) : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// Above this, a bed is a texture rather than a piece of music. Set from the
+// measured gap: real beds clustered around 0.04, the retired ones around 0.65.
+// 0.25 sits in empty space between the two populations.
+const NOISE_FLATNESS = Number(process.env.NOISE_FLATNESS ?? 0.25);
+
 async function measureTrack(file) {
   const duration = await probeDuration(file);
   let integrated = null;
@@ -324,11 +369,14 @@ async function measureTrack(file) {
     integrated = null;
   }
   const win = Math.min(4, Math.max(1, duration / 10));
+  const flatness = await spectralFlatness(file);
   return {
     duration_sec: Math.round(duration),
     integrated_lufs: integrated,
     true_peak_dbtp: truePeak,
     loudness_range_lu: range,
+    spectral_flatness: flatness,
+    reads_as_noise: flatness === null ? null : flatness > NOISE_FLATNESS,
     head_dbfs: await meanVolume(file, 0, win),
     tail_dbfs: await meanVolume(file, duration - win, win),
     transient: await transientScan(file, duration),
@@ -1096,7 +1144,21 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
   await fsp.rm(rawPath, { force: true });
 
   const duration = await probeDuration(outPath);
-  return { slug: safe, file_path: outPath, duration_sec: Math.round(duration) };
+  // Checked here rather than only in the report, because the cheapest moment
+  // to find out that a generation came back as texture instead of music is
+  // the moment it arrives — not after it has been through a two-hour render.
+  const flatness = await spectralFlatness(outPath);
+  if (flatness !== null && flatness > NOISE_FLATNESS) {
+    step(job, `WARNING: spectral flatness ${flatness} — this reads as noise, `
+      + `not music (music sits near 0.04, retired textures near 0.65)`);
+  }
+  return {
+    slug: safe,
+    file_path: outPath,
+    duration_sec: Math.round(duration),
+    spectral_flatness: flatness,
+    reads_as_noise: flatness === null ? null : flatness > NOISE_FLATNESS,
+  };
 }
 
 /**
@@ -1752,12 +1814,22 @@ async function renderAudition(job, input) {
     await fsp.rm(videoListPath, { force: true });
   }
 
-  const map = slugs.map((s, i) => ({
-    n: i + 1,
-    slug: s,
-    at: `${String(Math.floor(i * each / 60)).padStart(2, '0')}:`
-      + `${String(Math.round(i * each % 60)).padStart(2, '0')}`,
-  }));
+  // Measured after the render rather than before, so a slow measurement never
+  // sits between the listener and the thing they asked for. The flag is the
+  // point: a candidate that reads as noise can be discounted before it is
+  // played, and if the ear disagrees with the number that is worth knowing too.
+  const map = [];
+  for (let i = 0; i < slugs.length; i += 1) {
+    const flatness = await spectralFlatness(files[i]);
+    map.push({
+      n: i + 1,
+      slug: slugs[i],
+      at: `${String(Math.floor(i * each / 60)).padStart(2, '0')}:`
+        + `${String(Math.round(i * each % 60)).padStart(2, '0')}`,
+      spectral_flatness: flatness,
+      reads_as_noise: flatness === null ? null : flatness > NOISE_FLATNESS,
+    });
+  }
   return { file: outPath, seconds_each: each, total_sec: total, map };
 }
 
@@ -2082,6 +2154,87 @@ app.post('/jobs/short', (req, res) => {
  * first, which is the order WF-A cycles them in.
  */
 /**
+ * Lay a true binaural beat under an existing bed and save the result as a new
+ * bed. The source is left untouched.
+ *
+ * Body: { slug, source_slug, left_hz, right_hz, tone_db?, mood? }
+ *
+ * A binaural beat is two steady tones a few hertz apart, one in each ear; the
+ * brain hears the difference as a pulse at that gap. 68 Hz against 70 Hz gives
+ * a 2 Hz beat, which is the delta band the sleep channels label their tracks
+ * with. Asking a music model for this produces something that sounds roughly
+ * like it and measures wrong, so the tones are synthesised here to the hertz
+ * and mixed in at a fixed level instead.
+ *
+ * Two things this cannot do anything about, both worth stating plainly: the
+ * effect needs headphones, because on a speaker the two channels mix in the
+ * air before they reach either ear; and the evidence for binaural beats doing
+ * much of anything is thin. It is a format the audience searches for, not a
+ * treatment.
+ */
+app.post('/jobs/binaural', (req, res) => {
+  const { slug, source_slug, left_hz, right_hz, tone_db, mood } = req.body || {};
+  if (!slug || !source_slug || !left_hz || !right_hz) {
+    return res.status(400).json({
+      error: 'slug, source_slug, left_hz and right_hz are required',
+    });
+  }
+  const job = startJob('binaural', { slug }, async (j) => {
+    const safe = slugSafe(slug);
+    const src = path.join(DIRS.tracks, `${slugSafe(source_slug)}.mp3`);
+    if (!fs.existsSync(src)) throw new Error(`source track missing: ${src}`);
+    const out = path.join(DIRS.tracks, `${safe}.mp3`);
+
+    const lf = clampNum(Number(left_hz), 20, 1000, 68);
+    const rf = clampNum(Number(right_hz), 20, 1000, 70);
+    const beat = Math.abs(rf - lf);
+    if (beat < 0.5 || beat > 40) {
+      throw new Error(`a ${beat} Hz difference is not a usable beat frequency`);
+    }
+    // Quiet on purpose. The tones are meant to sit under the music, not to be
+    // a feature of it; louder than about -20 dB and a steady low sine stops
+    // being subliminal and starts being a hum somebody cannot unhear.
+    const db = clampNum(Number(tone_db), -40, -12, -24);
+    const seconds = await probeDuration(src);
+
+    step(j, `mixing a ${beat} Hz beat (${lf} Hz left, ${rf} Hz right) at ${db} dB `
+      + `under ${source_slug}`);
+    await ffmpeg([
+      '-i', src,
+      '-f', 'lavfi', '-t', String(seconds), '-i', `sine=frequency=${lf}:sample_rate=44100`,
+      '-f', 'lavfi', '-t', String(seconds), '-i', `sine=frequency=${rf}:sample_rate=44100`,
+      '-filter_complex',
+      // join, not amerge: the two sines must stay in their own channels all
+      // the way to the file, because a beat that has been summed to mono is
+      // just two tones and no beat at all.
+      `[1:a][2:a]join=inputs=2:channel_layout=stereo,volume=${db}dB[tones];`
+        + `[0:a]aformat=sample_fmts=fltp:channel_layouts=stereo[bed];`
+        // normalize=0 matters. amix scales its inputs by 1/n by default, which
+        // would quietly drop the music 6 dB below every other bed on the volume.
+        + `[bed][tones]amix=inputs=2:duration=first:normalize=0,`
+        + `alimiter=limit=0.89:level=disabled[out]`,
+      '-map', '[out]',
+      '-c:a', 'libmp3lame', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+      out,
+    ], { timeoutMs: 15 * 60 * 1000 });
+
+    const m = await measureTrack(out);
+    return {
+      slug: safe,
+      source_slug: slugSafe(source_slug),
+      left_hz: lf,
+      right_hz: rf,
+      beat_hz: beat,
+      tone_db: db,
+      mood: mood || '',
+      headphones_only: true,
+      measured: m,
+    };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
  * Audition several beds in one video before committing any of them to a
  * session. Uploads unlisted and files it in no playlist.
  *
@@ -2098,7 +2251,9 @@ app.post('/jobs/audition', (req, res) => {
   }
   const job = startJob('audition', { run_id: input.run_id }, async (j) => {
     const built = await renderAudition(j, input);
-    const lines = built.map.map((m) => `${m.at}  —  ${m.n}. ${m.slug}`);
+    const lines = built.map.map((m) => `${m.at}  —  ${m.n}. ${m.slug}`
+      + (m.spectral_flatness === null ? '' : `  [flatness ${m.spectral_flatness}`
+        + `${m.reads_as_noise ? ' — READS AS NOISE' : ''}]`));
     const videoId = await uploadToYouTube(j, built.file, {
       title: String(input.title || 'Saltwater — bed audition (not for publication)').slice(0, 100),
       description: ['Working file. Each bed plays for '
