@@ -61,6 +61,26 @@ const FAL_MODEL = 'fal-ai/bytedance/seedance/v1/pro/fast/text-to-video';
  */
 const DEFAULT_DIM = clamp01(Number(process.env.LOOP_DIM ?? 0));
 
+/*
+ * Loop picture quality. Defaults reproduce the previous hard-coded values
+ * exactly, so nothing already in the library changes shape until it is
+ * deliberately rebuilt.
+ *
+ * These belong together: CRF sets how much detail the encoder keeps and
+ * maxrate caps the peaks. Moving one without the other is the classic way to
+ * change nothing and believe you tested something.
+ */
+const LOOP_CRF = clampNum(Number(process.env.LOOP_CRF), 14, 34, 26);
+const LOOP_MAXRATE = clampNum(Number(process.env.LOOP_MAXRATE), 600, 6000, 2500);
+
+/*
+ * What is asked of fal. 720p and ten seconds were hard-coded, which meant
+ * trying anything else was a redeploy. They are per-request now, with the old
+ * values as defaults.
+ */
+const VISUAL_RESOLUTION = String(process.env.VISUAL_RESOLUTION || '720p');
+const VISUAL_SECONDS = clampNum(Number(process.env.VISUAL_SECONDS), 3, 12, 10);
+
 // ---------------------------------------------------------------- utilities
 
 function clampNum(n, lo, hi, fallback) {
@@ -809,6 +829,25 @@ async function buildLoop(rawPath, loopPath, scale, look, motion) {
   // frame. One second is enough on slow water and visibly steps on anything
   // faster, because the eye catches the jump before the blend finishes.
   const slow = clampNum(motion && motion.slow, 1, 4, 1);
+
+  /*
+   * Picture quality, and why it is two dials rather than one.
+   *
+   * `crf` is what actually decides how much detail survives. `maxrate` only
+   * trims peaks. On slow water CRF 26 settles well below 2500 kbps on its own,
+   * so raising the cap by itself changes nothing at all — the encoder was
+   * never touching it. Anyone tuning only maxrate measures no difference and
+   * concludes bitrate does not matter here, which is the wrong conclusion
+   * drawn from a test that never changed the bitrate.
+   *
+   * Both are capped, because this file's bitrate is the finished session's
+   * bitrate: the two-hour render stream-copies it. 2500 kbps x 7200 s is a
+   * 2.25 GB upload; 6000 kbps is 5.4 GB, and the volume is 4.5 GB. So 6000 is
+   * the ceiling and even that only fits if little else is on disk.
+   */
+  const crf = Math.round(clampNum(motion && motion.crf, 14, 34, LOOP_CRF));
+  const maxrate = Math.round(clampNum(motion && motion.maxrate, 600, 6000, LOOP_MAXRATE));
+
   const raw = await probeDuration(rawPath).catch(() => 10);
   const total = raw * slow;
   // The fade has to fit twice inside the clip with material left in between.
@@ -859,8 +898,8 @@ async function buildLoop(rawPath, loopPath, scale, look, motion) {
     ...brand.inputs,
     '-filter_complex', filter,
     '-map', '[v]', '-an',
-    '-c:v', 'libx264', '-preset', 'slow', '-crf', '26',
-    '-maxrate', '2500k', '-bufsize', '5000k',
+    '-c:v', 'libx264', '-preset', 'slow', '-crf', String(crf),
+    '-maxrate', `${maxrate}k`, '-bufsize', `${maxrate * 2}k`,
     '-r', '30', '-g', '60', '-keyint_min', '60', '-sc_threshold', '0',
     '-movflags', '+faststart',
     loopPath,
@@ -873,23 +912,35 @@ async function buildLoop(rawPath, loopPath, scale, look, motion) {
  * Nothing longer is pre-encoded: the session render loops this file with
  * -stream_loop and -c:v copy, which costs almost nothing.
  */
-async function makeVisual(job, { slug, aspect, prompt, dim, vivid }) {
+async function makeVisual(job, {
+  slug, aspect, prompt, dim, vivid,
+  resolution, duration, slow, xfade, crf, maxrate, camera_fixed: cameraFixed,
+}) {
   const safe = slugSafe(slug);
   const isWide = aspect === '16x9';
   const scale = isWide ? '1920:1080' : '1080:1920';
   const rawPath = path.join(DIRS.visuals, `${safe}.mp4`);
   const loopPath = path.join(DIRS.loops, `${safe}_loop.mp4`);
 
-  step(job, 'requesting generation from fal');
+  // fal prices on pixels x frames, so resolution is the cost dial: a 10s
+  // 1080p clip is roughly 2.2x a 720p one, because that is the pixel ratio.
+  const wantRes = ['480p', '720p', '1080p'].indexOf(String(resolution)) === -1
+    ? VISUAL_RESOLUTION : String(resolution);
+  const wantSecs = clampNum(Number(duration), 3, 12, VISUAL_SECONDS);
+
+  step(job, `requesting generation from fal (${wantRes}, ${wantSecs}s)`);
   const res = await fetch(`https://fal.run/${FAL_MODEL}`, {
     method: 'POST',
     headers: { Authorization: `Key ${FAL_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       prompt,
       aspect_ratio: isWide ? '16:9' : '9:16',
-      resolution: '720p',
-      duration: 10,
-      camera_fixed: false,
+      resolution: wantRes,
+      duration: wantSecs,
+      // A locked camera is what a two-hour sleep scene wants. The old default
+      // let the model drift the frame, which reads as a slow pan that resets
+      // every loop.
+      camera_fixed: cameraFixed === undefined ? true : Boolean(cameraFixed),
     }),
   });
   if (!res.ok) throw new Error(`fal ${res.status}: ${(await res.text()).slice(0, 600)}`);
@@ -901,11 +952,35 @@ async function makeVisual(job, { slug, aspect, prompt, dim, vivid }) {
   const bytes = await download(url, rawPath);
 
   const look = lookFrom({ dim, vivid });
+  const motion = { slow, xfade, crf, maxrate };
   step(job, `building seamless loop (${describeLook(look)})`);
-  await buildLoop(rawPath, loopPath, scale, look);
+  await buildLoop(rawPath, loopPath, scale, look, motion);
 
-  const duration = await probeDuration(loopPath);
-  return { slug: safe, aspect, file_path: rawPath, loop_path: loopPath, source_bytes: bytes, loop_seconds: Number(duration.toFixed(2)), dim: look.dim, vivid: look.vivid };
+  const loopSeconds = await probeDuration(loopPath);
+  const loopBytes = await fsp.stat(loopPath).then((s) => s.size).catch(() => 0);
+  // The number that decides whether a two-hour session fits on the volume,
+  // reported here so it never has to be guessed: the session stream-copies
+  // this file, so its size scales straight from these seconds to 7200.
+  const projected7200 = loopSeconds > 0
+    ? Math.round((loopBytes / loopSeconds) * 7200) : 0;
+  return {
+    slug: safe,
+    aspect,
+    file_path: rawPath,
+    loop_path: loopPath,
+    source_bytes: bytes,
+    loop_seconds: Number(loopSeconds.toFixed(2)),
+    loop_bytes: loopBytes,
+    projected_2h_bytes: projected7200,
+    projected_2h_gb: Number((projected7200 / 1e9).toFixed(2)),
+    resolution: wantRes,
+    requested_seconds: wantSecs,
+    crf: Math.round(clampNum(crf, 14, 34, LOOP_CRF)),
+    maxrate_kbps: Math.round(clampNum(maxrate, 600, 6000, LOOP_MAXRATE)),
+    slow: clampNum(slow, 1, 4, 1),
+    dim: look.dim,
+    vivid: look.vivid,
+  };
 }
 
 /**
@@ -2341,6 +2416,15 @@ app.get('/health', async (_req, res) => {
     // on a health check than discovered in a finished video.
     font: findFont(),
     disk: await diskUsage(),
+    // The picture dials, so a deploy can be confirmed from the health check
+    // instead of by rendering something and looking at it.
+    loop: {
+      crf: LOOP_CRF,
+      maxrate_kbps: LOOP_MAXRATE,
+      projected_2h_gb_at_maxrate: Number((LOOP_MAXRATE * 1000 / 8 * 7200 / 1e9).toFixed(2)),
+      visual_resolution: VISUAL_RESOLUTION,
+      visual_seconds: VISUAL_SECONDS,
+    },
     configured: {
       render_key: Boolean(RENDER_KEY),
       fal: Boolean(FAL_KEY),
@@ -2399,10 +2483,23 @@ app.get('/jobs/:id', (req, res) => {
 });
 
 app.post('/jobs/visual', (req, res) => {
-  const { slug, aspect, prompt, dim, vivid } = req.body || {};
+  const b = req.body || {};
+  const { slug, aspect, prompt, dim, vivid } = b;
   if (!slug || !prompt) return res.status(400).json({ error: 'slug and prompt are required' });
   if (aspect !== '16x9' && aspect !== '9x16') return res.status(400).json({ error: 'aspect must be 16x9 or 9x16' });
-  const job = startJob('visual', { slug, aspect }, (j) => makeVisual(j, { slug, aspect, prompt, dim, vivid }));
+  // resolution / duration reach fal; slow, xfade, crf and maxrate reach the
+  // loop build. All optional, all defaulting to the values that were
+  // hard-coded before, so existing callers are unaffected.
+  const job = startJob('visual', { slug, aspect }, (j) => makeVisual(j, {
+    slug, aspect, prompt, dim, vivid,
+    resolution: b.resolution,
+    duration: b.duration,
+    slow: b.slow,
+    xfade: b.xfade,
+    crf: b.crf,
+    maxrate: b.maxrate,
+    camera_fixed: b.camera_fixed,
+  }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
@@ -2481,7 +2578,10 @@ app.post('/jobs/reloop', (req, res) => {
     const skipped = [];
     for (const group of groups) {
       const look = lookFrom({ dim: group.dim, vivid: group.vivid });
-      const motion = { slow: group.slow, xfade: group.xfade };
+      const motion = {
+        slow: group.slow, xfade: group.xfade,
+        crf: group.crf, maxrate: group.maxrate,
+      };
       const wanted = Array.isArray(group.slugs) && group.slugs.length
         ? group.slugs.map(slugSafe).filter(Boolean)
         : null;
@@ -2511,8 +2611,17 @@ app.post('/jobs/reloop', (req, res) => {
         if (bright.corrected) {
           step(j, `  dimmed ${slug} from ${bright.before} to ${bright.after}`);
         }
+        const loopFile = path.join(DIRS.loops, `${slug}_loop.mp4`);
+        const lbytes = await fsp.stat(loopFile).then((s) => s.size).catch(() => 0);
+        const lsecs = await probeDuration(loopFile).catch(() => 0);
         rebuilt.push({ slug, dim: look.dim, vivid: look.vivid,
           slow: clampNum(motion.slow, 1, 4, 1), xfade: clampNum(motion.xfade, 0.5, 4, 1),
+          crf: Math.round(clampNum(motion.crf, 14, 34, LOOP_CRF)),
+          maxrate_kbps: Math.round(clampNum(motion.maxrate, 600, 6000, LOOP_MAXRATE)),
+          loop_seconds: Number(lsecs.toFixed(2)),
+          loop_bytes: lbytes,
+          projected_2h_gb: lsecs > 0
+            ? Number(((lbytes / lsecs) * 7200 / 1e9).toFixed(2)) : 0,
           brightness: bright });
       }
     }
