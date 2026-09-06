@@ -1554,8 +1554,60 @@ async function uploadToYouTube(job, file, meta) {
   if (!videoId) throw new Error('YouTube returned no video id');
   step(job, `uploaded as ${videoId}`);
 
+  await setThumbnail(job, youtube, videoId, meta);
   await addToPlaylist(job, youtube, videoId, meta.playlist_id);
   return videoId;
+}
+
+/**
+ * Give the video its own thumbnail instead of letting YouTube pick one.
+ *
+ * Left alone, YouTube chooses from three frames it samples itself. On a video
+ * that is deliberately graded to a mean luma in the forties, all three are
+ * dark, and the one it picks is usually the muddiest — which is how a
+ * two-hour render of a hand-painted moonlit shore ends up represented by a
+ * grey rectangle in search results.
+ *
+ * The first frame of the loop is the honest choice: it is the picture as the
+ * viewer will actually see it, after the zoom crop, the grade and the corner
+ * mark, so the thumbnail cannot promise something the video does not show.
+ * Scaled to 1280x720 and encoded generously — the 2 MB ceiling is far away at
+ * this resolution and thumbnail compression is what makes a dark image band.
+ *
+ * Non-fatal for the same reason as the playlist: the upload already cost an
+ * hour of CPU, and a thumbnail that would not set must not turn a published
+ * video into a failed run. Custom thumbnails also need a verified channel, so
+ * on an unverified account this fails every time and must stay harmless.
+ */
+async function setThumbnail(job, youtube, videoId, meta) {
+  const slug = slugSafe(meta.thumbnail_slug
+    || meta.visual_slug
+    || (Array.isArray(meta.visual_slugs) ? meta.visual_slugs[0] : ''));
+  if (!slug) return null;
+  const loop = path.join(DIRS.loops, `${slug}_loop.mp4`);
+  if (!fs.existsSync(loop)) {
+    step(job, `no loop for ${slug}; leaving YouTube to pick a thumbnail`);
+    return null;
+  }
+  const thumb = path.join(DIRS.tmp, `${slug}_thumb.jpg`);
+  try {
+    await ffmpeg([
+      '-i', loop, '-frames:v', '1',
+      '-vf', 'scale=1280:720:flags=lanczos',
+      '-q:v', '2', thumb,
+    ], { timeoutMs: 60000 });
+    await youtube.thumbnails.set({
+      videoId,
+      media: { mimeType: 'image/jpeg', body: fs.createReadStream(thumb) },
+    });
+    step(job, `set custom thumbnail from ${slug}`);
+    return slug;
+  } catch (err) {
+    step(job, `thumbnail not set (video is still published): ${err.message}`);
+    return null;
+  } finally {
+    await fsp.rm(thumb, { force: true });
+  }
 }
 
 /**
@@ -1586,6 +1638,127 @@ async function addToPlaylist(job, youtube, videoId, override) {
     step(job, `playlist add failed (video is still published): ${err.message}`);
     return null;
   }
+}
+
+/**
+ * Build one video that plays several beds back to back so they can be judged
+ * before anything is committed to a two-hour render.
+ *
+ * The gap this fills: audio could be put onto the volume and measured, but the
+ * only way to actually hear a bed was to render two hours of video and upload
+ * it. That is why beds that were plainly noise rather than music survived in
+ * rotation for weeks — every check the pipeline ran was a level check, and no
+ * level check can tell a pad from a hiss. A ten-minute audition costs one
+ * upload and settles it by ear in ten minutes.
+ *
+ * Deliberately different from renderSession in one respect: the beds are cut
+ * hard, not crossfaded. A crossfade here would blend two candidates into each
+ * other at exactly the moment the listener is deciding between them, and it
+ * would make the timings inexact. Each bed gets exactly `seconds_each`, so
+ * candidate k begins at (k-1) * seconds_each and can be named by the clock.
+ *
+ * `skip_sec` steps over the fade-in that generated beds start with, so the
+ * first thing heard is the bed proper rather than three seconds of nothing.
+ * Everything else — the sleep compressor, the visual, the encoder — is what a
+ * real session uses, so what is auditioned is what gets shipped.
+ */
+async function renderAudition(job, input) {
+  const runId = slugSafe(input.run_id);
+  const slug = slugSafe(input.visual_slug);
+  const loop = path.join(DIRS.loops, `${slug}_loop.mp4`);
+  if (!fs.existsSync(loop)) throw new Error(`visual loop missing: ${loop}`);
+
+  const slugs = (input.tracks || []).map(slugSafe).filter(Boolean);
+  if (slugs.length < 2) throw new Error('an audition needs at least two tracks');
+  if (slugs.length > 20) throw new Error('an audition takes at most twenty tracks');
+  const files = slugs.map((s) => path.join(DIRS.tracks, `${s}.mp3`));
+  for (const f of files) {
+    if (!fs.existsSync(f)) throw new Error(`track missing: ${f}`);
+  }
+
+  const each = clampNum(Number(input.seconds_each), 20, 300, 60);
+  const skip = clampNum(Number(input.skip_sec), 0, 60, 5);
+  const total = each * files.length;
+  const fade = 0.75;
+
+  const stripPath = path.join(DIRS.tmp, `${runId}_audition.wav`);
+  const videoListPath = path.join(DIRS.tmp, `${runId}_audition_video.txt`);
+  const outPath = path.join(DIRS.renders, `${runId}.mp4`);
+
+  // apad between the two atrims is what makes the timings exact. Without it a
+  // bed shorter than skip + each yields a short segment, every candidate after
+  // it slides earlier, and the timing map handed to the listener is wrong from
+  // that point on — the one thing an audition cannot get away with.
+  // The skip has to give way to the bed's actual length. A bed of exactly
+  // `each` seconds asked to skip five would be padded with five seconds of
+  // digital silence at the end of its slot — which, in an audition whose whole
+  // purpose is to judge whether the audio is right, reads as the audio being
+  // broken. Take as much of the head off as the bed can spare and no more.
+  const lengths = [];
+  for (const f of files) lengths.push(await probeDuration(f).catch(() => 0));
+  const short = [];
+  files.forEach((_f, i) => {
+    if (lengths[i] > 0 && lengths[i] < each) short.push(`${slugs[i]} (${Math.round(lengths[i])}s)`);
+  });
+  if (short.length) {
+    step(job, `shorter than the ${each}s slot, will be padded: ${short.join(', ')}`);
+  }
+
+  const args = [];
+  for (const f of files) args.push('-i', f);
+  const parts = [];
+  const labels = [];
+  files.forEach((_f, i) => {
+    const head = lengths[i] > 0 ? Math.max(0, Math.min(skip, lengths[i] - each)) : skip;
+    parts.push(`[${i}:a]atrim=start=${head.toFixed(3)}:duration=${each},asetpts=N/SR/TB,`
+      + `apad,atrim=duration=${each},asetpts=N/SR/TB,`
+      + `afade=t=in:st=0:d=${fade},afade=t=out:st=${(each - fade).toFixed(2)}:d=${fade},`
+      + `aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[c${i}]`);
+    labels.push(`[c${i}]`);
+  });
+  parts.push(`${labels.join('')}concat=n=${files.length}:v=0:a=1[out]`);
+
+  step(job, `cutting ${files.length} beds to ${each}s each (${Math.round(total / 60)} min)`);
+  await ffmpeg(args.concat([
+    '-filter_complex', parts.join(';'),
+    '-map', '[out]',
+    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+    stripPath,
+  ]), { timeoutMs: 15 * 60 * 1000 });
+
+  await buildVideoList(videoListPath, [loop], total, Math.min(300, total));
+
+  // sleepDrc() is empty when SLEEP_DRC=0, and `-af ''` is an ffmpeg error
+  // rather than a no-op, so the flag has to disappear with the filter.
+  const drc = sleepDrc().replace(/,$/, '');
+  step(job, `rendering the audition over ${slug}`);
+  try {
+    await ffmpeg([
+      '-f', 'concat', '-safe', '0', '-i', videoListPath,
+      '-i', stripPath,
+      '-t', String(total),
+      '-map', '0:v:0', '-map', '1:a:0',
+      '-c:v', 'copy',
+      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+    ].concat(drc ? ['-af', drc] : []).concat([
+      '-movflags', '+faststart',
+      outPath,
+    ]), { timeoutMs: 30 * 60 * 1000 });
+  } catch (err) {
+    await fsp.rm(outPath, { force: true });
+    throw err;
+  } finally {
+    await fsp.rm(stripPath, { force: true });
+    await fsp.rm(videoListPath, { force: true });
+  }
+
+  const map = slugs.map((s, i) => ({
+    n: i + 1,
+    slug: s,
+    at: `${String(Math.floor(i * each / 60)).padStart(2, '0')}:`
+      + `${String(Math.round(i * each % 60)).padStart(2, '0')}`,
+  }));
+  return { file: outPath, seconds_each: each, total_sec: total, map };
 }
 
 // ------------------------------------------------------------ housekeeping
@@ -1908,6 +2081,48 @@ app.post('/jobs/short', (req, res) => {
  * Joins are reported in filename order and wrap from the last bed back to the
  * first, which is the order WF-A cycles them in.
  */
+/**
+ * Audition several beds in one video before committing any of them to a
+ * session. Uploads unlisted and files it in no playlist.
+ *
+ * Body: { run_id, visual_slug, tracks: [slug], seconds_each?, skip_sec?,
+ *         title?, privacy_status? }
+ */
+app.post('/jobs/audition', (req, res) => {
+  const input = req.body || {};
+  if (!input.run_id || !input.visual_slug
+    || !Array.isArray(input.tracks) || input.tracks.length < 2) {
+    return res.status(400).json({
+      error: 'run_id, visual_slug and a tracks array of at least two slugs are required',
+    });
+  }
+  const job = startJob('audition', { run_id: input.run_id }, async (j) => {
+    const built = await renderAudition(j, input);
+    const lines = built.map.map((m) => `${m.at}  —  ${m.n}. ${m.slug}`);
+    const videoId = await uploadToYouTube(j, built.file, {
+      title: String(input.title || 'Saltwater — bed audition (not for publication)').slice(0, 100),
+      description: ['Working file. Each bed plays for '
+        + `${built.seconds_each} seconds, cut hard, in this order:`, '']
+        .concat(lines).join('\n'),
+      tags: '',
+      visual_slug: input.visual_slug,
+      privacy_status: input.privacy_status || 'unlisted',
+      playlist_id: 'none',
+    });
+    await fsp.rm(built.file, { force: true });
+    step(j, 'deleted local render after successful upload');
+    return {
+      video_id: videoId,
+      url: `https://youtu.be/${videoId}`,
+      seconds_each: built.seconds_each,
+      total_sec: built.total_sec,
+      map: built.map,
+      disk: await diskUsage(),
+    };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
 app.post('/jobs/audio', (_req, res) => {
   const job = startJob('audio', {}, async (j) => {
     const files = (await fsp.readdir(DIRS.tracks).catch(() => []))
