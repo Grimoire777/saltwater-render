@@ -418,26 +418,6 @@ async function measureTrack(file) {
   };
 }
 
-/**
- * Width and height of a file's first video stream. Returns nulls rather than
- * throwing — every caller has a sensible answer for "don't know".
- */
-async function probeSize(file) {
-  try {
-    const { stdout } = await run('ffprobe', [
-      '-v', 'error', '-select_streams', 'v:0',
-      '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', file,
-    ], { timeoutMs: 60000 });
-    const m = stdout.trim().split('x');
-    const w = Number(m[0]);
-    const h = Number(m[1]);
-    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) return { w, h };
-  } catch (err) {
-    // fall through
-  }
-  return { w: null, h: null };
-}
-
 async function probeStreams(file) {
   const { stdout } = await run('ffprobe', [
     '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file,
@@ -1957,35 +1937,37 @@ async function renderShort(job, input) {
     }
     step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
-  // Put the mark back.
+  // Put the mark on, always.
   //
-  // It is burned into the 16:9 loop already, bottom-left — and cropping that
-  // frame to 9:16 keeps only the middle 56% of its width, so the corner it
-  // lives in is precisely what gets thrown away. It vanished from the first
-  // Shorts and the loop was never at fault.
+  // Two failed attempts at being clever about this, so here is the reasoning
+  // in full.
   //
-  // Redrawn at the same size and in the same corner the 9:16 loops used, so a
-  // Short made this way is indistinguishable from the ones that came before
-  // it. Bottom-left, 30% of the width, at the standard margin — left because
-  // YouTube's own action rail owns the right edge, and two marks in one corner
-  // reads as a mistake rather than a brand.
+  // On a cropped 16:9 loop the mark is definitely missing: it is burned in at
+  // the bottom-left, and taking the middle 56% of the width throws that corner
+  // away. So it has to be redrawn there.
   //
-  // Only when the source was landscape and got cropped. A loop that is already
-  // vertical still has its own mark inside the frame, and drawing a second one
-  // over it would put the wordmark on top of itself — which is worse than the
-  // missing mark this exists to fix.
-  const srcSize = await probeSize(loopPath);
-  const wasCropped = !srcSize.w || srcSize.w > srcSize.h;
-  if (!wasCropped) {
-    step(job, 'source is already vertical — keeping the mark it was built with');
-  }
-  // Whether the mark is drawn decides whether its file is an ffmpeg input at
-  // all. The first version always passed the input "so the indices stay fixed"
-  // but only wrote the file inside this branch, so the very first vertical
-  // Short died on "No such file or directory" for an input it was never going
-  // to use. An input that might not exist is not free.
-  const drawMark = wasCropped && BRAND_MODE !== 'off' && BRAND_OPACITY > 0
-    && ensureLockup();
+  // On an already-vertical loop I skipped the redraw, on the grounds that such
+  // a loop carries its own mark. That is only true of loops built after the
+  // branding went in. tide-9x16-mtmf656w was built at 03:56 on 4 September and
+  // branding landed that afternoon, so it has no mark and the Short went out
+  // without one.
+  //
+  // Inferring from the file is guesswork either way, and the two errors are
+  // not equal. A missing mark is a plain defect. A doubled one is not, because
+  // the redraw lands in the same corner at the same relative size and the same
+  // opacity as the burned-in one, so the two coincide almost exactly and read
+  // as a single, slightly firmer mark. Given a choice between sometimes absent
+  // and sometimes marginally denser, always-draw is the right side to be
+  // wrong on.
+  //
+  // Bottom-left, 30% of the width, standard margin — left because YouTube's
+  // own action rail owns the right edge.
+  //
+  // Whether the mark is drawn also decides whether its file is an ffmpeg input
+  // at all. An earlier version always passed the input "so the indices stay
+  // fixed" but only wrote the file when drawing, so the first vertical Short
+  // died opening a file for a mark it was never going to use.
+  const drawMark = BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup();
   if (drawMark) {
     const markW = Math.round(W * clamp01(Number(process.env.BRAND_SHORT_WIDTH_PCT ?? 0.30)));
     const margin = Math.round(W * BRAND_MARGIN_PCT);
