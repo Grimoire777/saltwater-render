@@ -418,6 +418,26 @@ async function measureTrack(file) {
   };
 }
 
+/**
+ * Width and height of a file's first video stream. Returns nulls rather than
+ * throwing — every caller has a sensible answer for "don't know".
+ */
+async function probeSize(file) {
+  try {
+    const { stdout } = await run('ffprobe', [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', file,
+    ], { timeoutMs: 60000 });
+    const m = stdout.trim().split('x');
+    const w = Number(m[0]);
+    const h = Number(m[1]);
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) return { w, h };
+  } catch (err) {
+    // fall through
+  }
+  return { w: null, h: null };
+}
+
 async function probeStreams(file) {
   const { stdout } = await run('ffprobe', [
     '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', file,
@@ -1949,7 +1969,17 @@ async function renderShort(job, input) {
   // it. Bottom-left, 30% of the width, at the standard margin — left because
   // YouTube's own action rail owns the right edge, and two marks in one corner
   // reads as a mistake rather than a brand.
-  if (BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup()) {
+  //
+  // Only when the source was landscape and got cropped. A loop that is already
+  // vertical still has its own mark inside the frame, and drawing a second one
+  // over it would put the wordmark on top of itself — which is worse than the
+  // missing mark this exists to fix.
+  const srcSize = await probeSize(loopPath);
+  const wasCropped = !srcSize.w || srcSize.w > srcSize.h;
+  if (!wasCropped) {
+    step(job, 'source is already vertical — keeping the mark it was built with');
+  }
+  if (wasCropped && BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup()) {
     const markW = Math.round(W * clamp01(Number(process.env.BRAND_SHORT_WIDTH_PCT ?? 0.30)));
     const margin = Math.round(W * BRAND_MARGIN_PCT);
     parts.push(`[4:v]scale=${markW}:-1,format=rgba,`
