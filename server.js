@@ -369,10 +369,16 @@ const TRACK_LUFS = clampNum(Number(process.env.TRACK_LUFS), -32, -12, -22);
 
 function loudnormFilter(targetLufs) {
   const t = clampNum(Number(targetLufs), -32, -12, TRACK_LUFS);
-  // TP scales with the target. Leaving the ceiling at -1.5 while dropping the
-  // integrated level six decibels would leave the peaks where they were and
-  // quietly widen the crest factor — the opposite of "smoother to listen to".
-  const tp = Math.min(-1.5, t + 6);
+  // The true-peak ceiling has to come down with the integrated level, or a
+  // quieter master keeps its old peaks and simply gains crest factor — the
+  // opposite of "smoother to listen to".
+  //
+  // The clamp is not cosmetic: loudnorm only accepts TP in [-9, 0] and errors
+  // out otherwise. A first cut at this used t + 6 with no lower bound, which
+  // asked for TP = -16 at a -22 target and failed every single job with
+  // "Value -16.000000 for parameter 'TP' out of range". +13 gives a natural
+  // 13 dB crest for ambient and lands inside the range everywhere it matters.
+  const tp = Math.max(-9, Math.min(-1.5, t + 13));
   return { filter: `loudnorm=I=${t}:TP=${tp.toFixed(1)}:LRA=11`, target: t };
 }
 
