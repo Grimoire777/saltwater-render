@@ -2176,11 +2176,27 @@ async function renderShort(job, input) {
     }
     step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
-  // Put the mark on, always.
-  //
-  // Two failed attempts at being clever about this, so here is the reasoning
-  // in full.
-  //
+  /*
+   * The mark is OFF on Shorts from 2026-09-06, by decision.
+   *
+   * On a 9:16 phone screen it competes with the captions and with YouTube's
+   * own action rail, and a Short's job is to stop a thumb, not to sign itself.
+   * Long-form keeps the mark: nobody scrolls past a two-hour video.
+   *
+   * One thing this cannot undo. The mark is burned into a loop at loop-build
+   * time, not here. A Short cropped from a 16:9 loop loses it automatically,
+   * because the crop takes the middle 56% of the width and the mark lives in
+   * the bottom-left corner — so turning the redraw off leaves it genuinely
+   * unmarked. But a Short cut from a native 9:16 loop built after branding
+   * landed carries the mark inside the loop itself, and no setting here can
+   * remove it; that loop has to be rebuilt with BRAND_MODE=off.
+   *
+   * Everything below is the reasoning for the old always-draw behaviour, kept
+   * because it explains why the redraw exists at all and what breaks if
+   * someone switches it back on carelessly.
+   *
+   * Two failed attempts at being clever about this, so here it is in full.
+   */
   // On a cropped 16:9 loop the mark is definitely missing: it is burned in at
   // the bottom-left, and taking the middle 56% of the width throws that corner
   // away. So it has to be redrawn there.
@@ -2206,7 +2222,14 @@ async function renderShort(job, input) {
   // at all. An earlier version always passed the input "so the indices stay
   // fixed" but only wrote the file when drawing, so the first vertical Short
   // died opening a file for a mark it was never going to use.
-  const drawMark = BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup();
+  // Default off for Shorts. `brand: true` on a single job puts it back, and
+  // SHORT_BRAND=on flips the default, so the decision is reversible without
+  // another deploy.
+  const brandWanted = input.brand === undefined
+    ? String(process.env.SHORT_BRAND || 'off').toLowerCase() !== 'off'
+    : Boolean(input.brand);
+  const drawMark = brandWanted && BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup();
+  step(job, drawMark ? 'drawing the mark bottom-left' : 'no mark on this Short');
   if (drawMark) {
     const markW = Math.round(W * clamp01(Number(process.env.BRAND_SHORT_WIDTH_PCT ?? 0.30)));
     const margin = Math.round(W * BRAND_MARGIN_PCT);
@@ -2716,6 +2739,8 @@ app.get('/health', async (_req, res) => {
     // Whether a sea is configured, and whether the file is actually there.
     // A missing ambience file does not fail a render, so without this the only
     // symptom would be a silent join nobody notices until they listen.
+    // Shorts carry no mark by default from 2026-09-06; long-form still does.
+    short_brand: String(process.env.SHORT_BRAND || 'off').toLowerCase() !== 'off',
     ambience: {
       slug: AMBIENCE_SLUG || null,
       db: AMBIENCE_DB,
