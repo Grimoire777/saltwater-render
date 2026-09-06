@@ -1747,12 +1747,20 @@ function textAlpha(inAt, outAt, fade, peak) {
  * Enforced here rather than trusted to the copy, because a style rule that
  * lives only in a document quietly stops being true.
  */
-function captionText(raw) {
+function captionLines(raw) {
   return String(raw)
-    .split('\n')
-    .map((line) => line.trim().replace(/\.+$/, ''))
+    .replace(/\\n/g, '\n')
+    // U+2028/2029 are line breaks too; normalise them rather than deleting
+    // them, or two lines silently run together into one word.
+    .replace(/[\u2028\u2029]/g, '\n')
+    .split(/\r?\n/)
+    // Strip every control character, not just the line breaks. Whatever
+    // arrives here has been through a Code node, JSON, HTTP and a file, and
+    // any one of those can leave something invisible behind.
+    .map((line) => line.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, '').trim())
+    .map((line) => line.replace(/\.+$/, ''))
     .filter((line) => line.length)
-    .join('\n');
+    .slice(0, 4);
 }
 
 function drawTextClause(file, size, yExpr, alphaExpr) {
@@ -1859,35 +1867,53 @@ async function renderShort(job, input) {
     const handover = clampNum(Number(input.handover_sec), 3,
       Math.max(4, seconds - 4), 10);
 
+    // One drawtext per line, never a newline inside the text.
+    //
+    // A multi-line caption used to be a single drawtext with "\n" in it, which
+    // is the obvious way to do it and rendered perfectly on ffmpeg 6. On the
+    // ffmpeg 8 in this image the text shaper maps that newline to a .notdef
+    // glyph — so the line still breaks AND a small empty box appears at the
+    // end of it. It shipped in the first real Short.
+    //
+    // Positioning each line explicitly costs nothing, removes the control
+    // character entirely rather than hoping the next ffmpeg handles it, and
+    // makes the line spacing an actual number instead of a font metric.
+    let n = 0;
+    const drawLines = async (raw, size, topExpr, alphaExpr, tag) => {
+      const lines = captionLines(raw);
+      const lead = Math.round(size * 1.34);
+      for (let i = 0; i < lines.length; i += 1) {
+        const f = path.join(DIRS.tmp, `${runId}_${tag}${i}.txt`);
+        await fsp.writeFile(f, lines[i], 'utf8');
+        written.push(f);
+        n += 1;
+        const y = i === 0 ? topExpr : `${topExpr}+${i * lead}`;
+        parts.push(`${last}${drawTextClause(f, size, y, alphaExpr)}[x${n}]`);
+        last = `[x${n}]`;
+      }
+      return lines;
+    };
+
     if (tip) {
-      const f = path.join(DIRS.tmp, `${runId}_tip.txt`);
-      await fsp.writeFile(f, captionText(tip), 'utf8');
-      written.push(f);
       // The instruction sits in the dark band above the picture, at reading
       // height. 54px is about 5% of the frame width — plainly readable on a
       // phone and deliberately not more than that. Large type on a sleep video
       // is the visual equivalent of raising your voice, and the picture is
       // supposed to be the thing being looked at.
-      parts.push(`${last}${drawTextClause(f, TIP_SIZE, 'h*0.135',
-        textAlpha(0.6, handover + 0.8, 1.2, 0.94))}[t1]`);
-      last = '[t1]';
+      const lines = await drawLines(tip, TIP_SIZE, 'h*0.10',
+        textAlpha(0.6, handover + 0.8, 1.2, 0.94), 'tip');
+      step(job, `tip: ${JSON.stringify(lines)}`);
     }
     if (cta) {
-      const f = path.join(DIRS.tmp, `${runId}_cta.txt`);
-      await fsp.writeFile(f, captionText(cta), 'utf8');
-      written.push(f);
       // The offer sits low, near where the link to the full video appears —
-      // but above y=1540, because YouTube's own caption, channel name and
-      // button rail cover everything below that. It starts fading in while the
-      // instruction is still leaving, so the frame is never empty and never
-      // carries both messages at once.
-      // Raised from 0.755 when the type grew to match the tip: two lines at
-      // 54px stand about 130px tall, and at the old position the second line
-      // finished at y=1576 — inside the strip YouTube covers with its caption
-      // and buttons. 0.72 lands the bottom of the text around 1508.
-      parts.push(`${last}${drawTextClause(f, CTA_SIZE, 'h*0.72',
-        textAlpha(handover, seconds - 0.4, 1.2, 0.90))}[t2]`);
-      last = '[t2]';
+      // but the last line has to finish above y=1540, because YouTube's own
+      // caption, channel name and button rail cover everything below that.
+      // Two lines of 54px stand about 145px, so 0.72 lands the bottom around
+      // 1530. It starts fading in while the instruction is still leaving, so
+      // the frame is never empty and never carries both messages at once.
+      const lines = await drawLines(cta, CTA_SIZE, 'h*0.72',
+        textAlpha(handover, seconds - 0.4, 1.2, 0.90), 'cta');
+      step(job, `cta: ${JSON.stringify(lines)}`);
     }
     step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
