@@ -1979,7 +1979,14 @@ async function renderShort(job, input) {
   if (!wasCropped) {
     step(job, 'source is already vertical — keeping the mark it was built with');
   }
-  if (wasCropped && BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup()) {
+  // Whether the mark is drawn decides whether its file is an ffmpeg input at
+  // all. The first version always passed the input "so the indices stay fixed"
+  // but only wrote the file inside this branch, so the very first vertical
+  // Short died on "No such file or directory" for an input it was never going
+  // to use. An input that might not exist is not free.
+  const drawMark = wasCropped && BRAND_MODE !== 'off' && BRAND_OPACITY > 0
+    && ensureLockup();
+  if (drawMark) {
     const markW = Math.round(W * clamp01(Number(process.env.BRAND_SHORT_WIDTH_PCT ?? 0.30)));
     const margin = Math.round(W * BRAND_MARGIN_PCT);
     parts.push(`[4:v]scale=${markW}:-1,format=rgba,`
@@ -2005,9 +2012,7 @@ async function renderShort(job, input) {
       // ordinary overlay thereafter.
       '-loop', '1', '-i', scrims.top,
       '-loop', '1', '-i', scrims.bottom,
-      // Input 4, always supplied so the input indices stay fixed whether or
-      // not the mark is drawn. An unused input costs nothing.
-      '-loop', '1', '-i', LOCKUP_PATH,
+    ].concat(drawMark ? ['-loop', '1', '-i', LOCKUP_PATH] : []).concat([
       '-t', String(seconds),
       '-filter_complex', parts.join(';'),
       '-map', '[v]', '-map', '1:a:0',
@@ -2016,7 +2021,7 @@ async function renderShort(job, input) {
       '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`,
       '-movflags', '+faststart',
       outPath,
-    ], { timeoutMs: 20 * 60 * 1000 });
+    ]), { timeoutMs: 20 * 60 * 1000 });
   } finally {
     for (const f of written) await fsp.rm(f, { force: true });
   }
