@@ -1643,6 +1643,29 @@ const TIP_SIZE = clampNum(Number(process.env.SHORT_TIP_SIZE), 28, 120, 54);
 // halves of the same message, one after the other, in the same voice.
 const CTA_SIZE = clampNum(Number(process.env.SHORT_CTA_SIZE), 24, 120, TIP_SIZE);
 
+/**
+ * The two gradient scrims, built once and kept in tmp.
+ *
+ * Cached deliberately: they never change, and the alternative — generating the
+ * ramp live for every frame of every Short — is what made the first attempt
+ * hang. Rebuilt automatically if the container's tmp is cleared.
+ */
+const SCRIM_TOP_PATH = path.join(os.tmpdir(), 'saltwater-scrim-top.png');
+const SCRIM_BOT_PATH = path.join(os.tmpdir(), 'saltwater-scrim-bottom.png');
+async function ensureScrims(w, topH, botH) {
+  if (!fs.existsSync(SCRIM_TOP_PATH)) {
+    await ffmpeg(['-f', 'lavfi', '-i',
+      `gradients=s=${w}x${topH}:c0=black@0.70:c1=black@0.0:x0=0:y0=0:x1=0:y1=${topH}`,
+      '-frames:v', '1', SCRIM_TOP_PATH], { timeoutMs: 60000 });
+  }
+  if (!fs.existsSync(SCRIM_BOT_PATH)) {
+    await ffmpeg(['-f', 'lavfi', '-i',
+      `gradients=s=${w}x${botH}:c0=black@0.0:c1=black@0.80:x0=0:y0=0:x1=0:y1=${botH}`,
+      '-frames:v', '1', SCRIM_BOT_PATH], { timeoutMs: 60000 });
+  }
+  return { top: SCRIM_TOP_PATH, bottom: SCRIM_BOT_PATH };
+}
+
 let fontPathCache;
 function findFont() {
   if (fontPathCache !== undefined) return fontPathCache;
@@ -1783,25 +1806,33 @@ async function renderShort(job, input) {
   const W = 1080;
   const H = 1920;
 
-  // The sharp frame is scaled 35% wider than the canvas and then cropped back,
-  // which makes it 819 px tall instead of the 608 it would be at exactly full
-  // width. At full width the painting occupied under a third of the screen and
-  // the rest was dead space; this gives it 43% and it reads as the subject
-  // rather than a letterboxed inset. The sides it loses are sky and sand.
+  // Full bleed: the picture is cropped to 9:16 and fills the screen, with the
+  // text over it.
   //
-  // The background is the same frame blurred, pushed down two stops and
-  // desaturated by nearly half. Left brighter it competes with the picture,
-  // and the glowing surf lands exactly where YouTube draws the caption and
-  // channel name.
-  const FG_W = Math.round(W * 1.35);
-  const FG_H = Math.round(FG_W * 9 / 16);
+  // An earlier version inset the whole 16:9 frame across the middle with a
+  // blurred copy filling the bands above and below. It preserved the entire
+  // composition, which sounded like the right trade and was not — on a phone
+  // it reads as a photo in a frame rather than a place you are looking at, and
+  // more than half the screen is spent on blur. Cropped, this painting keeps
+  // the surf, the glow, the moon path and the edge of the rock, and it fills
+  // the whole display.
+  //
+  // Two gradient scrims do the work the blurred bands used to do for
+  // legibility: a light one at the top and a stronger one at the bottom, both
+  // fading to nothing so there is no visible edge. They are not optional. The
+  // frame drifts for the whole Short, so whatever sits behind a caption at the
+  // first frame is not what sits behind it at the last, and the bottom of this
+  // picture is the brightest part of it.
+  const TOP_SCRIM = 480;
+  const BOT_SCRIM = 740;
+  const BOT_AT = H - BOT_SCRIM;
+  const scrims = await ensureScrims(W, TOP_SCRIM, BOT_SCRIM);
   const parts = [
-    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},`
-      + 'boxblur=48:2,eq=brightness=-0.20:saturation=0.55[bg]',
-    `[0:v]scale=${FG_W}:-2,crop=${W}:${FG_H}[fg]`,
-    '[bg][fg]overlay=(W-w)/2:(H-h)/2[base]',
+    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H}[b]`,
+    '[b][2:v]overlay=0:0[s1]',
+    `[s1][3:v]overlay=0:${BOT_AT}[s2]`,
   ];
-  let last = '[base]';
+  let last = '[s2]';
 
   // Two beats, not one.
   //
@@ -1809,14 +1840,15 @@ async function renderShort(job, input) {
   //   beat 2  the session that is waiting for them
   //
   // The order is the whole point. A call to action that arrives before the
-  // viewer has got anything is an advert; the same words after ten seconds of
-  // slower breathing are an offer. So the tip holds for most of the Short and
-  // the CTA lands in the last third, once the thing has already worked.
+  // viewer has got anything is an advert; the same words after they have
+  // actually breathed out once are an offer.
   //
-  // The tip is NOT on screen for three seconds. Reading it takes three
-  // seconds; doing it takes longer, and a breath instruction that vanishes
-  // before the breath is finished is worse than no instruction. It holds while
-  // they follow it.
+  // Ten seconds is the default handover, and it is a real number rather than a
+  // fraction of the Short so it does not drift when the length changes.
+  // Reading the line takes about three seconds and a slow exhale takes six to
+  // eight, so ten covers reading it and doing it once — which is the whole
+  // job. Anything under about five would put the instruction on screen for
+  // less time than the thing it asks for, which is worse than not asking.
   const font = findFont();
   const written = [];
   if (!font) {
@@ -1824,7 +1856,8 @@ async function renderShort(job, input) {
   } else {
     const tip = String(input.tip || input.hook || '').trim();
     const cta = String(input.cta || '').trim();
-    const handover = clamp01(Number(input.handover ?? 0.62)) * seconds;
+    const handover = clampNum(Number(input.handover_sec), 3,
+      Math.max(4, seconds - 4), 10);
 
     if (tip) {
       const f = path.join(DIRS.tmp, `${runId}_tip.txt`);
@@ -1866,6 +1899,15 @@ async function renderShort(job, input) {
     await ffmpeg([
       '-stream_loop', '-1', '-i', loopPath,
       '-ss', String(seek), '-t', String(seconds), '-i', trackPath,
+      // The scrims as still images, inputs 2 and 3.
+      //
+      // They were the `gradients` lavfi source first, which is correct and
+      // unusably slow: as a live source it recomputes the ramp for every frame
+      // of the Short, and a three-second test had not finished after five
+      // minutes. As a single PNG each takes 0.08s to make once and costs an
+      // ordinary overlay thereafter.
+      '-loop', '1', '-i', scrims.top,
+      '-loop', '1', '-i', scrims.bottom,
       '-t', String(seconds),
       '-filter_complex', parts.join(';'),
       '-map', '[v]', '-map', '1:a:0',
