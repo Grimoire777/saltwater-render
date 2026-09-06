@@ -1474,6 +1474,54 @@ async function sustainedEdges(file) {
   };
 }
 
+/**
+ * Rewrite an audio file so its end runs into its beginning without a splice.
+ *
+ * Needed because the ambience layer is looped with -stream_loop for the whole
+ * session. A wave recording that simply stops and restarts steps in amplitude
+ * at the wrap, and that step is a click — heard most clearly during a bed dip,
+ * when the sea is the only thing playing. Which is precisely the moment the
+ * ambience exists to cover.
+ *
+ * Same construction as the picture loop: hold back the first `fade` seconds,
+ * play the middle, then dissolve the file's own tail onto that held-back head.
+ * The dissolve ends on the frame the middle began with, so last equals first.
+ * Output is `fade` seconds shorter than the input.
+ *
+ * The dissolve is two explicit qsin fades summed with amix, NOT acrossfade.
+ * acrossfade looks like the obvious tool and is wrong here: given two pieces
+ * exactly as long as the fade, it emits an empty stream. Measured — the blend
+ * came out at 0.000s and the "closed" loop was simply the middle section, so
+ * the wrap it was supposed to remove was still there, 9.7 dB of step. The
+ * manual version measures -0.2 dB across the same wrap with no power notch
+ * through the blend.
+ */
+async function closeAudioLoop(src, dst, fadeSec) {
+  const total = await probeDuration(src);
+  const f = clampNum(fadeSec, 0.5, 20, 4);
+  if (!Number.isFinite(total) || total <= f * 3) {
+    throw new Error(`audio too short to close into a loop (${total}s, fade ${f}s)`);
+  }
+  const ff = f.toFixed(3);
+  const midEnd = (total - f).toFixed(3);
+  await ffmpeg([
+    '-i', src,
+    '-filter_complex',
+    `[0:a]asplit=3[h][m][t];`
+      + `[h]atrim=0:${ff},asetpts=PTS-STARTPTS,`
+      + `afade=t=in:st=0:d=${ff}:curve=qsin[head];`
+      + `[m]atrim=${ff}:${midEnd},asetpts=PTS-STARTPTS[mid];`
+      + `[t]atrim=${midEnd}:${total.toFixed(3)},asetpts=PTS-STARTPTS,`
+      + `afade=t=out:st=0:d=${ff}:curve=qsin[tailseg];`
+      + `[tailseg][head]amix=inputs=2:duration=shortest:normalize=0[blend];`
+      + `[mid][blend]concat=n=2:v=0:a=1[out]`,
+    '-map', '[out]',
+    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
+    dst,
+  ], { timeoutMs: 15 * 60 * 1000 });
+  return probeDuration(dst);
+}
+
 async function buildBedReel(job, bedPaths, reelPath) {
   const n = bedPaths.length;
   const inputs = [];
@@ -1577,21 +1625,14 @@ async function buildBedReel(job, bedPaths, reelPath) {
     await fsp.rename(chainPath, reelPath);
     return reelPath;
   }
-  const midEnd = (total - f).toFixed(3);
+  // Was an inline copy of the same construction, using acrossfade, which
+  // emits an empty blend when the pieces are exactly the fade length — so
+  // this path silently produced an unclosed reel. It never showed up because
+  // BED_JOIN defaults to dip and returns above. Fixed by sharing the helper,
+  // which is tested.
   step(job, `closing the reel loop (${Math.round(total)}s)`);
-  await ffmpeg([
-    '-i', chainPath,
-    '-filter_complex',
-    `[0:a]asplit=3[h][m][t];`
-      + `[h]atrim=0:${f},asetpts=PTS-STARTPTS[head];`
-      + `[m]atrim=${f}:${midEnd},asetpts=PTS-STARTPTS[mid];`
-      + `[t]atrim=${midEnd}:${total.toFixed(3)},asetpts=PTS-STARTPTS[tailseg];`
-      + `[tailseg][head]acrossfade=d=${f}:c1=qsin:c2=qsin[blend];`
-      + `[mid][blend]concat=n=2:v=0:a=1[out]`,
-    '-map', '[out]',
-    '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
-    reelPath,
-  ], { timeoutMs: 20 * 60 * 1000 });
+  const closed = await closeAudioLoop(chainPath, reelPath, f);
+  step(job, `  reel closed at ${closed.toFixed(1)}s`);
   await fsp.rm(chainPath, { force: true });
   return reelPath;
 }
@@ -1705,8 +1746,26 @@ async function renderSession(job, input) {
    * the input count, which would halve the music the moment a sea was added.
    */
   const ambSlug = slugSafe(String(input.ambience_slug || AMBIENCE_SLUG || ''));
-  const ambPath = ambSlug ? path.join(DIRS.tracks, `${ambSlug}.mp3`) : '';
-  const useAmb = Boolean(ambPath) && fs.existsSync(ambPath);
+  const ambSrc = ambSlug ? path.join(DIRS.tracks, `${ambSlug}.mp3`) : '';
+  let ambPath = '';
+  if (ambSrc && fs.existsSync(ambSrc)) {
+    // Built once and kept beside the source, because closing the loop costs a
+    // full decode and re-encode and the answer never changes.
+    const closed = path.join(DIRS.tracks, `${ambSlug}.closed.wav`);
+    if (!fs.existsSync(closed)) {
+      step(job, `closing ${ambSlug} into a seamless loop (first use)`);
+      try {
+        const secs = await closeAudioLoop(ambSrc, closed, 4);
+        step(job, `  ambience loop is ${secs.toFixed(1)}s and wraps cleanly`);
+      } catch (err) {
+        // Better a faint wrap in the sea than no sea at all.
+        await fsp.rm(closed, { force: true });
+        step(job, `  could not close the ambience loop (${err.message}); using it raw`);
+      }
+    }
+    ambPath = fs.existsSync(closed) ? closed : ambSrc;
+  }
+  const useAmb = Boolean(ambPath);
   if (ambSlug && !useAmb) {
     // Loud, because a missing sea is the difference between the video we
     // intended and the one with holes in it — and it must not fail the render.
@@ -2194,7 +2253,20 @@ async function uploadToYouTube(job, file, meta) {
         description: String(meta.description || '').slice(0, 5000),
         tags,
         categoryId: '10',
+        // The language of the title and description, not of the audio.
         defaultLanguage: 'en',
+        /*
+         * The language of the audio, which on this channel is none.
+         *
+         * "zxx" is the ISO code for no linguistic content, and it is the
+         * honest answer for two hours of instrumental music. Leaving it unset
+         * meant YouTube had to guess, and it guessed — which is how a Japanese
+         * caption track appeared on a video containing no words. It also tells
+         * the auto-dubbing system not to bother, which it cannot do here
+         * anyway: dubbing rejects music-only content and anything over 120
+         * minutes, and these are both.
+         */
+        defaultAudioLanguage: String(meta.audio_language || 'zxx'),
       },
       status: {
         privacyStatus: meta.privacy_status || 'private',
@@ -2210,9 +2282,68 @@ async function uploadToYouTube(job, file, meta) {
   if (!videoId) throw new Error('YouTube returned no video id');
   step(job, `uploaded as ${videoId}`);
 
+  await applyLocalizations(job, youtube, videoId, meta, res.data.snippet);
   await setThumbnail(job, youtube, videoId, meta);
   await addToPlaylist(job, youtube, videoId, meta.playlist_id);
   return videoId;
+}
+
+/**
+ * Write per-language titles and descriptions onto a freshly uploaded video.
+ *
+ * The caller supplies the whole map, because it is the caller that composed
+ * the English title and therefore the only thing that knows how to compose the
+ * other twenty-one. This service just delivers it.
+ *
+ * Two things about the API that are easy to get wrong:
+ *
+ *   videos.update REPLACES the parts it is given. Sending localizations wipes
+ *   any that were there before rather than merging, which is why this only
+ *   ever runs on a video it just created — a video someone has hand-edited in
+ *   Studio must never be sent through here.
+ *
+ *   The snippet has to go along for the ride. Updating localizations without
+ *   resending snippet.defaultLanguage fails with defaultLanguageNotSet, and
+ *   sending a partial snippet blanks whatever was left out. So the snippet the
+ *   insert returned is echoed back verbatim.
+ *
+ * Costs 50 quota units whether the map holds one language or fifty, against a
+ * 10,000/day budget of which the upload itself already spent 1,600.
+ *
+ * Non-fatal, deliberately. A published video without translations is a video;
+ * a failed job at this point would have thrown away the render and the upload.
+ */
+async function applyLocalizations(job, youtube, videoId, meta, snippet) {
+  const loc = meta && meta.localizations;
+  if (!loc || typeof loc !== 'object' || !Object.keys(loc).length) return null;
+
+  // Drop anything malformed rather than letting one bad row fail all of them,
+  // and hold to YouTube's own limits so the API does not reject the batch.
+  const clean = {};
+  for (const [lang, v] of Object.entries(loc)) {
+    if (!v || typeof v !== 'object') continue;
+    const title = String(v.title || '').trim().slice(0, 100);
+    if (!title) continue;
+    clean[lang] = { title, description: String(v.description || '').slice(0, 5000) };
+  }
+  const langs = Object.keys(clean);
+  if (!langs.length) return null;
+
+  try {
+    await youtube.videos.update({
+      part: ['snippet', 'localizations'],
+      requestBody: {
+        id: videoId,
+        snippet: Object.assign({}, snippet, { defaultLanguage: snippet.defaultLanguage || 'en' }),
+        localizations: clean,
+      },
+    });
+    step(job, `localised into ${langs.length} languages (${langs.join(', ')})`);
+    return langs;
+  } catch (err) {
+    step(job, `localisation failed (video is still published): ${err.message}`);
+    return null;
+  }
 }
 
 /**
