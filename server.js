@@ -70,6 +70,15 @@ const DEFAULT_DIM = clamp01(Number(process.env.LOOP_DIM ?? 0));
  * maxrate caps the peaks. Moving one without the other is the classic way to
  * change nothing and believe you tested something.
  */
+/*
+ * The sea that runs under every session. Set AMBIENCE_SLUG to a track on the
+ * volume and every render mixes it in beneath the music; leave it empty and
+ * renders behave exactly as before. AMBIENCE_DB is how far under the music it
+ * sits — both are overridable per job.
+ */
+const AMBIENCE_SLUG = String(process.env.AMBIENCE_SLUG || '');
+const AMBIENCE_DB = clampNum(Number(process.env.AMBIENCE_DB), -40, 0, -12);
+
 const LOOP_CRF = clampNum(Number(process.env.LOOP_CRF), 14, 34, 26);
 const LOOP_MAXRATE = clampNum(Number(process.env.LOOP_MAXRATE), 600, 6000, 2500);
 
@@ -1669,21 +1678,79 @@ async function renderSession(job, input) {
   const plan = await buildVideoList(videoListPath, loops, duration, segment);
 
   const fadeOutStart = Math.max(0, duration - 12);
+
+  /*
+   * The continuous layer under everything.
+   *
+   * Why this exists: beds are joined by a dip, meaning each one fades out to
+   * actual silence before the next fades up. I called that "close to
+   * unnoticeable" in buildBedReel. It is not. Twelve seconds of nothing every
+   * few minutes is startling in a dark room — a listener reported it at the
+   * first join he sat through.
+   *
+   * A dip is still the right way to join two unrelated pieces of music, so the
+   * fix is not to remove the hole but to put something in it. One sea running
+   * unbroken for the whole session means the music recedes into water rather
+   * than into silence, and the join stops being an event.
+   *
+   * It also replaces the old arrangement, where waves were baked into
+   * individual beds on a coin flip. That made the ocean appear and disappear
+   * every few minutes, and at a join you could lose the music and the sea in
+   * the same second.
+   *
+   * Level is a plain dB offset rather than a loudness target: the ambience
+   * asset is already mastered to the same -22 LUFS as the beds, so this just
+   * says how far under the music it sits. -12 dB is present but never in the
+   * way. amix carries normalize=0 because the default divides every input by
+   * the input count, which would halve the music the moment a sea was added.
+   */
+  const ambSlug = slugSafe(String(input.ambience_slug || AMBIENCE_SLUG || ''));
+  const ambPath = ambSlug ? path.join(DIRS.tracks, `${ambSlug}.mp3`) : '';
+  const useAmb = Boolean(ambPath) && fs.existsSync(ambPath);
+  if (ambSlug && !useAmb) {
+    // Loud, because a missing sea is the difference between the video we
+    // intended and the one with holes in it — and it must not fail the render.
+    step(job, `ambience "${ambSlug}" not found on the volume — rendering without it`);
+  }
+  const ambDb = clampNum(
+    input.ambience_db === undefined ? AMBIENCE_DB : Number(input.ambience_db),
+    -40, 0, AMBIENCE_DB,
+  );
+
+  const tail = `${sleepDrc()}afade=t=in:st=0:d=8,afade=t=out:st=${fadeOutStart}:d=12`;
+
+  // Built as two whole command lines rather than one line with pieces spliced
+  // into it at computed offsets. The spliced version was shorter and I could
+  // not read it, which is how an argument ends up in the wrong position and
+  // ffmpeg reports something that has nothing to do with the mistake.
+  const args = ['-f', 'concat', '-safe', '0', '-i', videoListPath,
+    '-stream_loop', '-1', '-i', reelPath];
+  if (useAmb) args.push('-stream_loop', '-1', '-i', ambPath);
+  args.push('-t', String(duration));
+  if (useAmb) {
+    args.push(
+      '-filter_complex',
+      `[2:a]volume=${ambDb}dB[sea];`
+        + `[1:a][sea]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];`
+        + `[mixed]${tail}[a]`,
+      '-map', '0:v:0', '-map', '[a]',
+    );
+  } else {
+    args.push('-map', '0:v:0', '-map', '1:a:0', '-af', tail);
+  }
+  args.push(
+    '-c:v', 'copy',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
+    '-movflags', '+faststart',
+    outPath,
+  );
+
   step(job, `rendering ${Math.round(duration / 60)} min session from ${loops.length} `
     + `visual(s) in ${plan.segments} segments of ${segment}s, `
-    + `${uniqueBeds.length} beds on a ${Math.round(reelSeconds)}s seamless reel`);
+    + `${uniqueBeds.length} beds on a ${Math.round(reelSeconds)}s seamless reel`
+    + (useAmb ? `, ${ambSlug} underneath at ${ambDb} dB` : ', no ambience layer'));
   try {
-    await ffmpeg([
-      '-f', 'concat', '-safe', '0', '-i', videoListPath,
-      '-stream_loop', '-1', '-i', reelPath,
-      '-t', String(duration),
-      '-map', '0:v:0', '-map', '1:a:0',
-      '-c:v', 'copy',
-      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2',
-      '-af', `${sleepDrc()}afade=t=in:st=0:d=8,afade=t=out:st=${fadeOutStart}:d=12`,
-      '-movflags', '+faststart',
-      outPath,
-    ], { timeoutMs: 60 * 60 * 1000 });
+    await ffmpeg(args, { timeoutMs: 60 * 60 * 1000 });
   } catch (err) {
     // A failed render leaves a partial file that can be gigabytes. Without this
     // the volume fills up and every subsequent night fails too.
@@ -2416,6 +2483,16 @@ app.get('/health', async (_req, res) => {
     // on a health check than discovered in a finished video.
     font: findFont(),
     disk: await diskUsage(),
+    // Whether a sea is configured, and whether the file is actually there.
+    // A missing ambience file does not fail a render, so without this the only
+    // symptom would be a silent join nobody notices until they listen.
+    ambience: {
+      slug: AMBIENCE_SLUG || null,
+      db: AMBIENCE_DB,
+      present: AMBIENCE_SLUG
+        ? fs.existsSync(path.join(DIRS.tracks, `${slugSafe(AMBIENCE_SLUG)}.mp3`))
+        : null,
+    },
     // The picture dials, so a deploy can be confirmed from the health check
     // instead of by rendering something and looking at it.
     loop: {
