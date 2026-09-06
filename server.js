@@ -1789,6 +1789,20 @@ async function renderSession(job, input) {
     -40, 0, AMBIENCE_DB,
   );
 
+  /*
+   * Holding the music back so the video opens on water alone.
+   *
+   * Only meaningful when there is an ambience layer — without one this would
+   * open on silence, so it is ignored in that case rather than producing a
+   * video that appears to be broken for its first few minutes.
+   *
+   * The delay is applied to the reel before it is mixed, and the reel is an
+   * infinite looped input, so this prepends the gap once and everything after
+   * it runs as normal.
+   */
+  const musicStart = clampNum(input.music_start_sec, 0, Math.max(0, duration - 60), 0);
+  const musicFade = clampNum(input.music_fade_sec, 1, 120, 20);
+
   const tail = `${sleepDrc()}afade=t=in:st=0:d=8,afade=t=out:st=${fadeOutStart}:d=12`;
 
   // Built as two whole command lines rather than one line with pieces spliced
@@ -1800,10 +1814,18 @@ async function renderSession(job, input) {
   if (useAmb) args.push('-stream_loop', '-1', '-i', ambPath);
   args.push('-t', String(duration));
   if (useAmb) {
+    const delayMs = Math.round(musicStart * 1000);
+    // adelay wants one value per channel, and the reel is stereo.
+    const music = musicStart > 0
+      ? `[1:a]adelay=${delayMs}|${delayMs},`
+        + `afade=t=in:st=${musicStart.toFixed(3)}:d=${musicFade.toFixed(3)}[music];`
+      : '';
+    const musicLabel = musicStart > 0 ? '[music]' : '[1:a]';
     args.push(
       '-filter_complex',
-      `[2:a]volume=${ambDb}dB[sea];`
-        + `[1:a][sea]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];`
+      music
+        + `[2:a]volume=${ambDb}dB[sea];`
+        + `${musicLabel}[sea]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];`
         + `[mixed]${tail}[a]`,
       '-map', '0:v:0', '-map', '[a]',
     );
@@ -1820,7 +1842,10 @@ async function renderSession(job, input) {
   step(job, `rendering ${Math.round(duration / 60)} min session from ${loops.length} `
     + `visual(s) in ${plan.segments} segments of ${segment}s, `
     + `${uniqueBeds.length} beds on a ${Math.round(reelSeconds)}s seamless reel`
-    + (useAmb ? `, ${ambSlug} underneath at ${ambDb} dB` : ', no ambience layer'));
+    + (useAmb ? `, ${ambSlug} underneath at ${ambDb} dB` : ', no ambience layer')
+    + (useAmb && musicStart > 0
+      ? `, water alone until ${Math.floor(musicStart / 60)}:${String(Math.round(musicStart % 60)).padStart(2, '0')} then music in over ${musicFade}s`
+      : ''));
   try {
     await ffmpeg(args, { timeoutMs: 60 * 60 * 1000 });
   } catch (err) {
