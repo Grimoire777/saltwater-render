@@ -1624,6 +1624,150 @@ async function renderSession(job, input) {
   return outPath;
 }
 
+/**
+ * Find a font ffmpeg can draw with.
+ *
+ * The image is node:20-alpine plus ffmpeg and nothing else, so until the
+ * Dockerfile installs one there is no font on the box at all and drawtext
+ * fails with "Cannot find a valid font". Rather than hard-code a path and
+ * discover that at 2am, scan the places a font could be and report the answer
+ * on /health, so a missing font is visible before a Short needs one.
+ *
+ * Cached: the filesystem does not change under a running container.
+ */
+// Type sizes on the 1080x1920 canvas. Both settable, because the right size is
+// a judgement made by looking rather than a number to derive.
+const TIP_SIZE = clampNum(Number(process.env.SHORT_TIP_SIZE), 28, 120, 54);
+// Same size as the tip, on purpose. Shrinking the second line made it read as
+// a footnote to the first, and it is not a footnote — the two beats are equal
+// halves of the same message, one after the other, in the same voice.
+const CTA_SIZE = clampNum(Number(process.env.SHORT_CTA_SIZE), 24, 120, TIP_SIZE);
+
+let fontPathCache;
+function findFont() {
+  if (fontPathCache !== undefined) return fontPathCache;
+  // Serif italic, regular weight — Jack's pick off a side-by-side render on a
+  // real frame.
+  //
+  // Bold was ruled out first: in either face it reads as shouting, which is
+  // the wrong register for a sleep video and for the moment someone sees it.
+  // Between the two regular italics, the sans is cleaner and the serif is
+  // quieter and more written — and the serif is the one that looks like it
+  // belongs beside a hand-painted picture rather than beside every other
+  // channel in the feed.
+  //
+  // FONT_PATH overrides everything, so changing face is a variable rather than
+  // a deploy.
+  const candidates = [
+    process.env.FONT_PATH,
+    // Alpine's font-dejavu
+    '/usr/share/fonts/dejavu/DejaVuSerif-Italic.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans-Oblique.ttf',
+    '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+    // Debian/Ubuntu layout, in case the base image ever changes
+    '/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+    '/usr/share/fonts/TTF/DejaVuSerif-Italic.ttf',
+  ].filter(Boolean);
+  fontPathCache = null;
+  for (const c of candidates) {
+    if (fs.existsSync(c)) { fontPathCache = c; break; }
+  }
+  return fontPathCache;
+}
+
+/**
+ * One drawtext clause.
+ *
+ * The caption goes through a file rather than inline. drawtext's own escaping
+ * treats ':' as an argument separator and "'" as a quote, so any caption with
+ * a colon or an apostrophe — "Can't sleep?" being the obvious one — either
+ * breaks the filter or silently loses characters. textfile sidesteps the whole
+ * problem.
+ *
+ * The shadow is not decoration. These frames are graded to a mean luma in the
+ * forties but carry bright areas — moonlight on water, bioluminescence — and
+ * white text over the bright part of a dark picture is the one place it
+ * disappears.
+ */
+/**
+ * A fade-in, hold, fade-out envelope for drawtext's alpha.
+ *
+ * Quoted, because the expression is full of commas and a bare comma in a
+ * filtergraph ends the filter. Nothing goes through a shell here, so the
+ * quotes reach ffmpeg's own parser, which is what has to see them.
+ *
+ * Ramps rather than hard cuts. Text that snaps on is the visual equivalent of
+ * a level step, and this is a sleep channel.
+ */
+function textAlpha(inAt, outAt, fade, peak) {
+  const a = inAt.toFixed(2);
+  const b = (inAt + fade).toFixed(2);
+  const c = (outAt - fade).toFixed(2);
+  const d = outAt.toFixed(2);
+  const p = peak.toFixed(2);
+  return `'if(lt(t,${a}),0,`
+    + `if(lt(t,${b}),${p}*(t-${a})/${fade},`
+    + `if(lt(t,${c}),${p},`
+    + `if(lt(t,${d}),${p}*(${d}-t)/${fade},0))))'`;
+}
+
+/**
+ * House style for on-screen copy: no full stop at the end of a line.
+ *
+ * A caption is not a sentence in a paragraph — the line break already does the
+ * separating, and the trailing dot makes it read as closed and formal where
+ * the whole register is meant to be unhurried. Question marks and commas stay,
+ * because those carry meaning; a period only carries finality.
+ *
+ * Enforced here rather than trusted to the copy, because a style rule that
+ * lives only in a document quietly stops being true.
+ */
+function captionText(raw) {
+  return String(raw)
+    .split('\n')
+    .map((line) => line.trim().replace(/\.+$/, ''))
+    .filter((line) => line.length)
+    .join('\n');
+}
+
+function drawTextClause(file, size, yExpr, alphaExpr) {
+  return [
+    `drawtext=fontfile=${findFont()}`,
+    `textfile=${file}`,
+    'fontcolor=white',
+    `alpha=${alphaExpr}`,
+    `fontsize=${size}`,
+    'line_spacing=16',
+    'x=(w-text_w)/2',
+    `y=${yExpr}`,
+    'shadowcolor=black@0.65',
+    'shadowx=0',
+    'shadowy=4',
+  ].join(':');
+}
+
+/**
+ * A vertical Short cut from the same picture and the same music as the session
+ * it advertises.
+ *
+ * Two things the first version did not do.
+ *
+ * **It needed its own 9:16 artwork,** and there was exactly one vertical
+ * visual in the library, itself retired for moving too much. So the Short pool
+ * was empty in practice. This builds 1080x1920 out of the 16:9 loop instead:
+ * a heavily blurred, slightly darkened copy of the frame fills the screen, and
+ * the sharp frame sits across the middle at full width. That is the standard
+ * vertical treatment for landscape source, and here it earns its place twice
+ * over — the painting's composition survives intact instead of being cropped
+ * to a ninth of its width, and the blurred bands above and below are exactly
+ * where the text wants to go.
+ *
+ * **It said nothing.** A silent dark loop in a vertical feed is a swipe. The
+ * hook and the call to action are burned in, because Shorts are watched with
+ * the sound off far more often than a sleep channel would like to admit.
+ */
 async function renderShort(job, input) {
   const runId = slugSafe(input.run_id);
   const loopPath = path.join(DIRS.loops, `${slugSafe(input.visual_slug)}_loop.mp4`);
@@ -1635,21 +1779,107 @@ async function renderShort(job, input) {
   const outPath = path.join(DIRS.renders, `${runId}.mp4`);
   const startAt = Number(input.audio_start_sec);
   const seek = Number.isFinite(startAt) ? startAt : 40;
+  const seconds = clampNum(Number(input.seconds), 10, 180, 40);
+  const W = 1080;
+  const H = 1920;
 
-  step(job, 'cutting 15s vertical short');
-  await ffmpeg([
-    '-stream_loop', '-1', '-i', loopPath,
-    '-ss', String(seek), '-t', '15', '-i', trackPath,
-    '-t', '15',
-    '-map', '0:v:0', '-map', '1:a:0',
-    '-c:v', 'libx264', '-preset', 'slow', '-crf', '20', '-r', '30', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-    '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=13:d=2`,
-    '-movflags', '+faststart',
-    outPath,
-  ], { timeoutMs: 15 * 60 * 1000 });
+  // The sharp frame is scaled 35% wider than the canvas and then cropped back,
+  // which makes it 819 px tall instead of the 608 it would be at exactly full
+  // width. At full width the painting occupied under a third of the screen and
+  // the rest was dead space; this gives it 43% and it reads as the subject
+  // rather than a letterboxed inset. The sides it loses are sky and sand.
+  //
+  // The background is the same frame blurred, pushed down two stops and
+  // desaturated by nearly half. Left brighter it competes with the picture,
+  // and the glowing surf lands exactly where YouTube draws the caption and
+  // channel name.
+  const FG_W = Math.round(W * 1.35);
+  const FG_H = Math.round(FG_W * 9 / 16);
+  const parts = [
+    `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},`
+      + 'boxblur=48:2,eq=brightness=-0.20:saturation=0.55[bg]',
+    `[0:v]scale=${FG_W}:-2,crop=${W}:${FG_H}[fg]`,
+    '[bg][fg]overlay=(W-w)/2:(H-h)/2[base]',
+  ];
+  let last = '[base]';
 
-  await verify(job, outPath, 15);
+  // Two beats, not one.
+  //
+  //   beat 1  a small thing the viewer can actually do, right now, for free
+  //   beat 2  the session that is waiting for them
+  //
+  // The order is the whole point. A call to action that arrives before the
+  // viewer has got anything is an advert; the same words after ten seconds of
+  // slower breathing are an offer. So the tip holds for most of the Short and
+  // the CTA lands in the last third, once the thing has already worked.
+  //
+  // The tip is NOT on screen for three seconds. Reading it takes three
+  // seconds; doing it takes longer, and a breath instruction that vanishes
+  // before the breath is finished is worse than no instruction. It holds while
+  // they follow it.
+  const font = findFont();
+  const written = [];
+  if (!font) {
+    step(job, 'no font on this image — rendering the short without captions');
+  } else {
+    const tip = String(input.tip || input.hook || '').trim();
+    const cta = String(input.cta || '').trim();
+    const handover = clamp01(Number(input.handover ?? 0.62)) * seconds;
+
+    if (tip) {
+      const f = path.join(DIRS.tmp, `${runId}_tip.txt`);
+      await fsp.writeFile(f, captionText(tip), 'utf8');
+      written.push(f);
+      // The instruction sits in the dark band above the picture, at reading
+      // height. 54px is about 5% of the frame width — plainly readable on a
+      // phone and deliberately not more than that. Large type on a sleep video
+      // is the visual equivalent of raising your voice, and the picture is
+      // supposed to be the thing being looked at.
+      parts.push(`${last}${drawTextClause(f, TIP_SIZE, 'h*0.135',
+        textAlpha(0.6, handover + 0.8, 1.2, 0.94))}[t1]`);
+      last = '[t1]';
+    }
+    if (cta) {
+      const f = path.join(DIRS.tmp, `${runId}_cta.txt`);
+      await fsp.writeFile(f, captionText(cta), 'utf8');
+      written.push(f);
+      // The offer sits low, near where the link to the full video appears —
+      // but above y=1540, because YouTube's own caption, channel name and
+      // button rail cover everything below that. It starts fading in while the
+      // instruction is still leaving, so the frame is never empty and never
+      // carries both messages at once.
+      // Raised from 0.755 when the type grew to match the tip: two lines at
+      // 54px stand about 130px tall, and at the old position the second line
+      // finished at y=1576 — inside the strip YouTube covers with its caption
+      // and buttons. 0.72 lands the bottom of the text around 1508.
+      parts.push(`${last}${drawTextClause(f, CTA_SIZE, 'h*0.72',
+        textAlpha(handover, seconds - 0.4, 1.2, 0.90))}[t2]`);
+      last = '[t2]';
+    }
+    step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
+  }
+  parts.push(`${last}format=yuv420p[v]`);
+
+  const fadeOut = Math.max(0, seconds - 2);
+  step(job, `cutting a ${seconds}s vertical short${font ? ' with captions' : ''}`);
+  try {
+    await ffmpeg([
+      '-stream_loop', '-1', '-i', loopPath,
+      '-ss', String(seek), '-t', String(seconds), '-i', trackPath,
+      '-t', String(seconds),
+      '-filter_complex', parts.join(';'),
+      '-map', '[v]', '-map', '1:a:0',
+      '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30',
+      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+      '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`,
+      '-movflags', '+faststart',
+      outPath,
+    ], { timeoutMs: 20 * 60 * 1000 });
+  } finally {
+    for (const f of written) await fsp.rm(f, { force: true });
+  }
+
+  await verify(job, outPath, seconds);
   return outPath;
 }
 
@@ -1978,6 +2208,9 @@ app.get('/health', async (_req, res) => {
     ok: true,
     ffmpeg: ffmpegVersion,
     data_dir: DATA_DIR,
+    // Null here means Shorts will render without their captions. Better seen
+    // on a health check than discovered in a finished video.
+    font: findFont(),
     disk: await diskUsage(),
     configured: {
       render_key: Boolean(RENDER_KEY),
