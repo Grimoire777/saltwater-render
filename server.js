@@ -76,6 +76,16 @@ const DEFAULT_DIM = clamp01(Number(process.env.LOOP_DIM ?? 0));
  * renders behave exactly as before. AMBIENCE_DB is how far under the music it
  * sits — both are overridable per job.
  */
+/*
+ * What language the audio is in. "zxx" is the ISO code for no linguistic
+ * content, which is the honest answer for instrumental music and stops YouTube
+ * guessing — guessing is how a Japanese caption track appeared on a video with
+ * no words in it. Applied after upload, never during, and skipped silently if
+ * YouTube refuses it. Set AUDIO_LANGUAGE='' to stop trying entirely.
+ */
+const AUDIO_LANGUAGE = process.env.AUDIO_LANGUAGE === undefined
+  ? 'zxx' : String(process.env.AUDIO_LANGUAGE);
+
 const AMBIENCE_SLUG = String(process.env.AMBIENCE_SLUG || '');
 const AMBIENCE_DB = clampNum(Number(process.env.AMBIENCE_DB), -40, 0, -12);
 
@@ -524,7 +534,10 @@ async function finishJob(job, result) {
 
 async function failJob(job, err) {
   job.status = 'error';
-  job.error = err && err.message ? err.message : String(err);
+  // describeApiError, not err.message. A googleapis rejection stringifies to
+  // the bare word "Error" with the reason buried in response.data, and a job
+  // whose recorded failure is "Error" tells whoever reads it nothing at all.
+  job.error = describeApiError(err);
   job.updated_at = new Date().toISOString();
   console.error(`[${job.kind}:${job.id}] FAILED ${job.error}`);
   await persistJob(job);
@@ -2254,19 +2267,14 @@ async function uploadToYouTube(job, file, meta) {
         tags,
         categoryId: '10',
         // The language of the title and description, not of the audio.
+        //
+        // Nothing else optional goes in here. This call carries the rendered
+        // file, costs 1,600 quota units and an hour of CPU to reach, and a
+        // rejected field throws all of it away — which is exactly what
+        // happened when defaultAudioLanguage was set here and YouTube refused
+        // the value. Everything that is nice to have is applied afterwards by
+        // finishVideo, where a failure costs nothing.
         defaultLanguage: 'en',
-        /*
-         * The language of the audio, which on this channel is none.
-         *
-         * "zxx" is the ISO code for no linguistic content, and it is the
-         * honest answer for two hours of instrumental music. Leaving it unset
-         * meant YouTube had to guess, and it guessed — which is how a Japanese
-         * caption track appeared on a video containing no words. It also tells
-         * the auto-dubbing system not to bother, which it cannot do here
-         * anyway: dubbing rejects music-only content and anything over 120
-         * minutes, and these are both.
-         */
-        defaultAudioLanguage: String(meta.audio_language || 'zxx'),
       },
       status: {
         privacyStatus: meta.privacy_status || 'private',
@@ -2282,68 +2290,134 @@ async function uploadToYouTube(job, file, meta) {
   if (!videoId) throw new Error('YouTube returned no video id');
   step(job, `uploaded as ${videoId}`);
 
-  await applyLocalizations(job, youtube, videoId, meta, res.data.snippet);
+  await finishVideo(job, youtube, videoId, meta, res.data.snippet);
   await setThumbnail(job, youtube, videoId, meta);
   await addToPlaylist(job, youtube, videoId, meta.playlist_id);
   return videoId;
 }
 
 /**
- * Write per-language titles and descriptions onto a freshly uploaded video.
+ * Everything applied to a video AFTER it exists: the audio language, and the
+ * per-language titles and descriptions.
  *
- * The caller supplies the whole map, because it is the caller that composed
- * the English title and therefore the only thing that knows how to compose the
- * other twenty-one. This service just delivers it.
+ * Split out from the upload deliberately. Setting defaultAudioLanguage inside
+ * videos.insert killed the whole job when YouTube refused the value, throwing
+ * away a completed render. Anything optional belongs in a follow-up call that
+ * is allowed to fail, and this one is: a published video without translations
+ * is still a published video.
  *
- * Two things about the API that are easy to get wrong:
+ * Two things about videos.update that are easy to get wrong:
  *
- *   videos.update REPLACES the parts it is given. Sending localizations wipes
- *   any that were there before rather than merging, which is why this only
- *   ever runs on a video it just created — a video someone has hand-edited in
- *   Studio must never be sent through here.
+ *   It REPLACES the parts it is given. Sending localizations wipes whatever
+ *   was there rather than merging, which is why this only ever runs on a video
+ *   it just created — a video someone has hand-edited in Studio must never be
+ *   sent through here.
  *
  *   The snippet has to go along for the ride. Updating localizations without
- *   resending snippet.defaultLanguage fails with defaultLanguageNotSet, and
- *   sending a partial snippet blanks whatever was left out. So the snippet the
- *   insert returned is echoed back verbatim.
+ *   resending snippet.defaultLanguage fails with defaultLanguageNotSet, and a
+ *   partial snippet blanks whatever is left out. So the snippet the insert
+ *   returned is echoed back with only the fields we mean to change.
  *
- * Costs 50 quota units whether the map holds one language or fifty, against a
- * 10,000/day budget of which the upload itself already spent 1,600.
+ * Costs 50 quota units regardless of how many languages, against a 10,000/day
+ * budget of which the upload already spent 1,600.
  *
- * Non-fatal, deliberately. A published video without translations is a video;
- * a failed job at this point would have thrown away the render and the upload.
+ * The two changes are attempted together and then, if that is refused, one at
+ * a time — so an unsupported audio language cannot cost us the translations,
+ * and vice versa.
  */
-async function applyLocalizations(job, youtube, videoId, meta, snippet) {
-  const loc = meta && meta.localizations;
-  if (!loc || typeof loc !== 'object' || !Object.keys(loc).length) return null;
+async function finishVideo(job, youtube, videoId, meta, snippet) {
+  const audioLang = String(meta.audio_language || AUDIO_LANGUAGE || '').trim();
 
   // Drop anything malformed rather than letting one bad row fail all of them,
   // and hold to YouTube's own limits so the API does not reject the batch.
   const clean = {};
-  for (const [lang, v] of Object.entries(loc)) {
-    if (!v || typeof v !== 'object') continue;
-    const title = String(v.title || '').trim().slice(0, 100);
-    if (!title) continue;
-    clean[lang] = { title, description: String(v.description || '').slice(0, 5000) };
+  const loc = meta && meta.localizations;
+  if (loc && typeof loc === 'object') {
+    for (const [lang, v] of Object.entries(loc)) {
+      if (!v || typeof v !== 'object') continue;
+      const title = String(v.title || '').trim().slice(0, 100);
+      if (!title) continue;
+      clean[lang] = { title, description: String(v.description || '').slice(0, 5000) };
+    }
   }
   const langs = Object.keys(clean);
-  if (!langs.length) return null;
+  if (!audioLang && !langs.length) return null;
 
-  try {
-    await youtube.videos.update({
-      part: ['snippet', 'localizations'],
-      requestBody: {
-        id: videoId,
-        snippet: Object.assign({}, snippet, { defaultLanguage: snippet.defaultLanguage || 'en' }),
-        localizations: clean,
-      },
-    });
-    step(job, `localised into ${langs.length} languages (${langs.join(', ')})`);
-    return langs;
-  } catch (err) {
-    step(job, `localisation failed (video is still published): ${err.message}`);
-    return null;
+  const base = Object.assign({}, snippet, {
+    defaultLanguage: snippet.defaultLanguage || 'en',
+  });
+
+  async function attempt(withAudio, withLocs) {
+    const body = { id: videoId, snippet: Object.assign({}, base) };
+    const parts = ['snippet'];
+    if (withAudio) body.snippet.defaultAudioLanguage = audioLang;
+    if (withLocs) { body.localizations = clean; parts.push('localizations'); }
+    await youtube.videos.update({ part: parts, requestBody: body });
   }
+
+  const wantAudio = Boolean(audioLang);
+  const wantLocs = langs.length > 0;
+  try {
+    await attempt(wantAudio, wantLocs);
+    const bits = [];
+    if (wantAudio) bits.push(`audio language ${audioLang}`);
+    if (wantLocs) bits.push(`${langs.length} localisations (${langs.join(', ')})`);
+    step(job, `set ${bits.join(' and ')}`);
+    return { audio: wantAudio ? audioLang : null, langs };
+  } catch (err) {
+    step(job, `combined metadata update refused (${describeApiError(err)}) — retrying separately`);
+  }
+
+  const out = { audio: null, langs: [] };
+  if (wantLocs) {
+    try {
+      await attempt(false, true);
+      step(job, `set ${langs.length} localisations (${langs.join(', ')})`);
+      out.langs = langs;
+    } catch (err) {
+      step(job, `localisations failed (video is still published): ${describeApiError(err)}`);
+    }
+  }
+  if (wantAudio) {
+    try {
+      await attempt(true, false);
+      step(job, `set audio language ${audioLang}`);
+      out.audio = audioLang;
+    } catch (err) {
+      step(job, `audio language "${audioLang}" rejected: ${describeApiError(err)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Turn a googleapis error into something a log line can use.
+ *
+ * Their errors stringify to the bare word "Error" surprisingly often, with
+ * everything useful hidden in response.data. A job that failed with a message
+ * of "Error" is a job nobody can debug — that happened once already.
+ */
+function describeApiError(err) {
+  const d = err && err.response && err.response.data;
+  const inner = d && d.error;
+  const parts = [];
+  if (inner && inner.message) parts.push(inner.message);
+  if (inner && Array.isArray(inner.errors)) {
+    for (const e of inner.errors) {
+      const bit = [e.reason, e.location].filter(Boolean).join(' @ ');
+      if (bit) parts.push(bit);
+    }
+  }
+  if (!parts.length && err && err.message) parts.push(err.message);
+  // Not everything thrown is an Error. A bare string carries its own meaning
+  // and must not be flattened to "unknown".
+  if (!parts.length && typeof err === 'string' && err.trim()) parts.push(err.trim());
+  if (!parts.length && err !== null && err !== undefined) {
+    const s = String(err);
+    if (s && s !== '[object Object]') parts.push(s);
+  }
+  if (!parts.length) parts.push('unknown error');
+  return parts.join('; ').slice(0, 400);
 }
 
 /**
