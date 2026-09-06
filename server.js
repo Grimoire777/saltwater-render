@@ -1810,7 +1810,27 @@ async function renderShort(job, input) {
   const outPath = path.join(DIRS.renders, `${runId}.mp4`);
   const startAt = Number(input.audio_start_sec);
   const seek = Number.isFinite(startAt) ? startAt : 40;
-  const seconds = clampNum(Number(input.seconds), 10, 180, 40);
+  let seconds = clampNum(Number(input.seconds), 10, 180, 40);
+
+  // Snap the length to a whole number of visual loop cycles.
+  //
+  // The picture loop is palindromic — its last frame is its first frame — so a
+  // Short that runs for an exact multiple of it starts and ends on the same
+  // image and repeats invisibly. Anything else does not: a 30-second Short cut
+  // from a 29-second loop ends one second into the second pass, so when the
+  // Shorts feed loops it, the picture jumps. That is a real visible fault at
+  // the seam and the sort of thing that reads as "something happened at the
+  // end" without being nameable.
+  const loopSeconds = await probeDuration(loopPath).catch(() => 0);
+  if (loopSeconds > 1) {
+    const cycles = Math.max(1, Math.round(seconds / loopSeconds));
+    const snapped = Math.round(cycles * loopSeconds * 1000) / 1000;
+    if (Math.abs(snapped - seconds) > 0.05) {
+      step(job, `snapping ${seconds}s to ${snapped}s — `
+        + `${cycles} x the ${loopSeconds.toFixed(2)}s picture loop, so it repeats seamlessly`);
+      seconds = snapped;
+    }
+  }
   const W = 1080;
   const H = 1920;
 
@@ -1917,6 +1937,27 @@ async function renderShort(job, input) {
     }
     step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
+  // Put the mark back.
+  //
+  // It is burned into the 16:9 loop already, bottom-left — and cropping that
+  // frame to 9:16 keeps only the middle 56% of its width, so the corner it
+  // lives in is precisely what gets thrown away. It vanished from the first
+  // Shorts and the loop was never at fault.
+  //
+  // Redrawn at the same size and in the same corner the 9:16 loops used, so a
+  // Short made this way is indistinguishable from the ones that came before
+  // it. Bottom-left, 30% of the width, at the standard margin — left because
+  // YouTube's own action rail owns the right edge, and two marks in one corner
+  // reads as a mistake rather than a brand.
+  if (BRAND_MODE !== 'off' && BRAND_OPACITY > 0 && ensureLockup()) {
+    const markW = Math.round(W * clamp01(Number(process.env.BRAND_SHORT_WIDTH_PCT ?? 0.30)));
+    const margin = Math.round(W * BRAND_MARGIN_PCT);
+    parts.push(`[4:v]scale=${markW}:-1,format=rgba,`
+      + `colorchannelmixer=aa=${BRAND_OPACITY.toFixed(3)}[mark]`);
+    parts.push(`${last}[mark]overlay=${margin}:H-h-${margin}[br]`);
+    last = '[br]';
+  }
+
   parts.push(`${last}format=yuv420p[v]`);
 
   const fadeOut = Math.max(0, seconds - 2);
@@ -1934,6 +1975,9 @@ async function renderShort(job, input) {
       // ordinary overlay thereafter.
       '-loop', '1', '-i', scrims.top,
       '-loop', '1', '-i', scrims.bottom,
+      // Input 4, always supplied so the input indices stay fixed whether or
+      // not the mark is drawn. An unused input costs nothing.
+      '-loop', '1', '-i', LOCKUP_PATH,
       '-t', String(seconds),
       '-filter_complex', parts.join(';'),
       '-map', '[v]', '-map', '1:a:0',
