@@ -347,6 +347,35 @@ async function spectralFlatness(file) {
 // 0.25 sits in empty space between the two populations.
 const NOISE_FLATNESS = Number(process.env.NOISE_FLATNESS ?? 0.25);
 
+/**
+ * How loud a finished bed sits, in LUFS.
+ *
+ * This was -16 for the whole life of the pipeline, which was simply the wrong
+ * target. -16 LUFS is the podcast and broadcast convention: it exists so
+ * speech stays intelligible over road noise. Sleep music is the opposite
+ * problem — it plays in a silent room, to someone who is trying to stop
+ * noticing it, often through a speaker a metre from their head. Everything the
+ * channel has published has been mastered about six decibels too loud for the
+ * only situation it is ever used in.
+ *
+ * -22 is the new default. YouTube only ever turns loud uploads down toward its
+ * own -14 reference and never turns quiet ones up, so a quieter master stays
+ * quiet on playback — which is the whole point.
+ *
+ * Overridable per job with target_lufs, because some material wants to sit
+ * further back still.
+ */
+const TRACK_LUFS = clampNum(Number(process.env.TRACK_LUFS), -32, -12, -22);
+
+function loudnormFilter(targetLufs) {
+  const t = clampNum(Number(targetLufs), -32, -12, TRACK_LUFS);
+  // TP scales with the target. Leaving the ceiling at -1.5 while dropping the
+  // integrated level six decibels would leave the peaks where they were and
+  // quietly widen the crest factor — the opposite of "smoother to listen to".
+  const tp = Math.min(-1.5, t + 6);
+  return { filter: `loudnorm=I=${t}:TP=${tp.toFixed(1)}:LRA=11`, target: t };
+}
+
 async function measureTrack(file) {
   const duration = await probeDuration(file);
   let integrated = null;
@@ -1113,7 +1142,7 @@ async function makeImportVisual(job, { slug, aspect, url, dim, vivid, start, sou
 }
 
 /** Generate a music bed on ElevenLabs and loudness-match it to the rest. */
-async function makeTrack(job, { slug, prompt, length_ms }) {
+async function makeTrack(job, { slug, prompt, length_ms, target_lufs }) {
   const safe = slugSafe(slug);
   const rawPath = path.join(DIRS.tmp, `${safe}_raw.mp3`);
   const outPath = path.join(DIRS.tracks, `${safe}.mp3`);
@@ -1134,10 +1163,11 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
   if (!res.ok) throw new Error(`elevenlabs ${res.status}: ${(await res.text()).slice(0, 600)}`);
   await fsp.writeFile(rawPath, Buffer.from(await res.arrayBuffer()));
 
-  step(job, 'normalising loudness to -16 LUFS');
+  const ln = loudnormFilter(target_lufs);
+  step(job, `normalising loudness to ${ln.target} LUFS`);
   await ffmpeg([
     '-i', rawPath,
-    '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+    '-af', ln.filter,
     '-c:a', 'libmp3lame', '-b:a', '192k',
     outPath,
   ], { timeoutMs: 10 * 60 * 1000 });
@@ -1175,7 +1205,7 @@ async function makeTrack(job, { slug, prompt, length_ms }) {
  * stereo because a mono source would otherwise play only on one side of the
  * render's stereo pair.
  */
-async function makeImportTrack(job, { slug, url, mood }) {
+async function makeImportTrack(job, { slug, url, mood, target_lufs }) {
   const safe = slugSafe(slug);
   const tmpPath = path.join(DIRS.tmp, `${safe}_import.bin`);
   const outPath = path.join(DIRS.tracks, `${safe}.mp3`);
@@ -1185,11 +1215,12 @@ async function makeImportTrack(job, { slug, url, mood }) {
 
   try {
     const before = await measureTrack(tmpPath);
+    const ln = loudnormFilter(target_lufs);
     step(job, `source ${before.duration_sec}s at ${before.integrated_lufs} LUFS`
-      + ` — normalising to -16`);
+      + ` — normalising to ${ln.target}`);
     await ffmpeg([
       '-i', tmpPath,
-      '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11',
+      '-af', ln.filter,
       '-ac', '2', '-ar', '44100',
       '-c:a', 'libmp3lame', '-b:a', '192k',
       outPath,
@@ -1290,6 +1321,14 @@ async function makeImportTrack(job, { slug, url, mood }) {
  */
 const BED_XFADE = clampNum(Number(process.env.BED_XFADE), 1, 30, 3);
 
+// 'dip' — fade out to nothing, fade the next up from nothing, no overlap.
+// 'xfade' — the old equal-power dissolve. See buildBedReel for why dip won.
+const BED_JOIN = String(process.env.BED_JOIN || 'dip').toLowerCase();
+
+// Long enough that the level change is a drift rather than a duck, short
+// enough that the quiet patch never feels like the music stopped.
+const BED_FADE = clampNum(Number(process.env.BED_FADE), 1, 30, 6);
+
 /**
  * Find where a bed's sustained material actually starts and stops.
  *
@@ -1353,36 +1392,76 @@ async function buildBedReel(job, bedPaths, reelPath) {
   // Trim each bed back to its sustained region before anything else.
   const parts = [];
   const labels = [];
+  const durations = [];
   let trimmed = 0;
   for (let i = 0; i < n; i += 1) {
     const e = await sustainedEdges(bedPaths[i]);
+    const full = await probeDuration(bedPaths[i]).catch(() => 0);
     const label = `[t${i}]`;
     labels.push(label);
     if (e && (e.start > 0 || e.end > 0)) {
       parts.push(`[${i}:a]atrim=${e.start}:${e.end},asetpts=PTS-STARTPTS${label}`);
+      durations.push(Math.max(1, e.end - e.start));
       trimmed += 1;
     } else {
       parts.push(`[${i}:a]anull${label}`);
+      durations.push(Math.max(1, full));
     }
   }
   if (trimmed) step(job, `trimmed the built-in fades off ${trimmed} of ${n} beds`);
 
-  // Chain the beds together, each dissolving into the next. With a single bed
-  // there is nothing to chain — but it still goes through the loop close
-  // below, because a lone bed spliced against itself has exactly the same
-  // fade-out-into-fade-in problem as two different ones.
-  if (n === 1) {
-    parts.push(`${labels[0]}anull[chained]`);
-  }
-  let cur = labels[0];
-  for (let i = 1; i < n; i += 1) {
-    const out = i === n - 1 ? '[chained]' : `[x${i}]`;
-    parts.push(`${cur}${labels[i]}acrossfade=d=${BED_XFADE}:c1=qsin:c2=qsin${out}`);
-    cur = `[x${i}]`;
+  // How one bed becomes the next.
+  //
+  // "dip" is the default and exists because the crossfade was wrong. An
+  // equal-power dissolve holds both beds at -3 dB through the middle of the
+  // transition, which is exactly loud enough for two unrelated pieces of music
+  // in two unrelated keys to be heard fighting. Jack caught that three times
+  // running, through two different fixes, and the reason no crossfade length
+  // helped is that overlap itself was the problem.
+  //
+  // So: don't overlap. Fade one out to nothing, fade the next up from nothing,
+  // butt them together. Nothing is ever sounding at the same time as anything
+  // else, so there is nothing to clash. The cost is a soft dip in level every
+  // few minutes, which on sleep music is close to unnoticeable and is in any
+  // case far less noticeable than a key clash.
+  //
+  // In dip mode the reel also needs no loop close: the last bed already fades
+  // out and the first already fades in, so the wrap is the same dip as every
+  // other join.
+  const dip = BED_JOIN === 'dip';
+  if (dip) {
+    const f = BED_FADE;
+    const fades = [];
+    for (let i = 0; i < n; i += 1) {
+      const d = durations[i];
+      const outAt = Math.max(0, d - f).toFixed(3);
+      parts.push(`${labels[i]}afade=t=in:st=0:d=${f},`
+        + `afade=t=out:st=${outAt}:d=${f}[f${i}]`);
+      fades.push(`[f${i}]`);
+    }
+    if (n === 1) {
+      parts.push(`[f0]anull[chained]`);
+    } else {
+      parts.push(`${fades.join('')}concat=n=${n}:v=0:a=1[chained]`);
+    }
+  } else {
+    // The old equal-power dissolve, kept behind BED_JOIN=xfade so the previous
+    // behaviour can be restored in one variable if the dip turns out worse.
+    if (n === 1) {
+      parts.push(`${labels[0]}anull[chained]`);
+    }
+    let cur = labels[0];
+    for (let i = 1; i < n; i += 1) {
+      const out = i === n - 1 ? '[chained]' : `[x${i}]`;
+      parts.push(`${cur}${labels[i]}acrossfade=d=${BED_XFADE}:c1=qsin:c2=qsin${out}`);
+      cur = `[x${i}]`;
+    }
   }
 
   const chainPath = path.join(DIRS.tmp, `${path.basename(reelPath, '.wav')}_chain.wav`);
-  step(job, `crossfading ${n} beds at ${BED_XFADE}s`);
+  step(job, dip
+    ? `joining ${n} beds with a ${BED_FADE}s dip between each`
+    : `crossfading ${n} beds at ${BED_XFADE}s`);
   await ffmpeg([
     ...inputs,
     '-filter_complex', parts.join(';'),
@@ -1390,6 +1469,14 @@ async function buildBedReel(job, bedPaths, reelPath) {
     '-c:a', 'pcm_s16le', '-ar', '44100', '-ac', '2',
     chainPath,
   ], { timeoutMs: 20 * 60 * 1000 });
+
+  // In dip mode the wrap is already a dip, so there is nothing to close.
+  if (dip) {
+    const reelSeconds = await probeDuration(chainPath).catch(() => 0);
+    step(job, `reel is ${Math.round(reelSeconds)}s and already loops cleanly`);
+    await fsp.rename(chainPath, reelPath);
+    return reelPath;
+  }
 
   // Close the reel into a loop, so the join between one repeat and the next is
   // a crossfade too rather than the one hard splice we would have left behind.
@@ -2076,9 +2163,70 @@ app.post('/jobs/reloop', (req, res) => {
 });
 
 app.post('/jobs/track', (req, res) => {
-  const { slug, prompt, length_ms } = req.body || {};
+  const { slug, prompt, length_ms, target_lufs } = req.body || {};
   if (!slug || !prompt) return res.status(400).json({ error: 'slug and prompt are required' });
-  const job = startJob('track', { slug }, (j) => makeTrack(j, { slug, prompt, length_ms }));
+  const job = startJob('track', { slug },
+    (j) => makeTrack(j, { slug, prompt, length_ms, target_lufs }));
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Re-normalise a bed already on the volume to a different loudness.
+ *
+ * Needed because the target changed after the library was built: everything
+ * generated before this was mastered at -16 LUFS, which is a speech target and
+ * about six decibels too loud for music whose entire job is to be ignorable in
+ * a silent room. Regenerating would produce different music; this changes only
+ * the level of the music that was already approved.
+ *
+ * Reversible in the same way as /jobs/flatten: the first relevel of a bed
+ * writes the untouched original beside it as <slug>.orig.mp3 and never
+ * overwrites that, so repeated relevels always work from the original rather
+ * than compounding on each other.
+ *
+ * Body: { slug, target_lufs }
+ */
+app.post('/jobs/relevel', (req, res) => {
+  const { slug, target_lufs } = req.body || {};
+  if (!slug) return res.status(400).json({ error: 'slug is required' });
+  const job = startJob('relevel', { slug }, async (j) => {
+    const safe = slugSafe(slug);
+    const file = path.join(DIRS.tracks, `${safe}.mp3`);
+    const orig = path.join(DIRS.tracks, `${safe}.orig.mp3`);
+    if (!fs.existsSync(file)) throw new Error(`track missing: ${file}`);
+
+    if (!fs.existsSync(orig)) {
+      await fsp.copyFile(file, orig);
+      step(j, `kept the original as ${safe}.orig.mp3`);
+    } else {
+      step(j, `working from the original kept at ${safe}.orig.mp3`);
+    }
+
+    const before = await measureTrack(orig);
+    const ln = loudnormFilter(target_lufs);
+    const tmp = path.join(DIRS.tmp, `${safe}_relevel.mp3`);
+    step(j, `${before.integrated_lufs} LUFS -> ${ln.target}`);
+    await ffmpeg([
+      '-i', orig,
+      '-af', ln.filter,
+      '-ac', '2', '-ar', '44100',
+      '-c:a', 'libmp3lame', '-b:a', '192k',
+      tmp,
+    ], { timeoutMs: 10 * 60 * 1000 });
+    await fsp.rename(tmp, file);
+
+    const after = await measureTrack(file);
+    return {
+      slug: safe,
+      target_lufs: ln.target,
+      before_lufs: before.integrated_lufs,
+      after_lufs: after.integrated_lufs,
+      true_peak_dbtp: after.true_peak_dbtp,
+      loudness_range_lu: after.loudness_range_lu,
+      spectral_flatness: after.spectral_flatness,
+      original_kept_at: `${safe}.orig.mp3`,
+    };
+  });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
@@ -2091,9 +2239,10 @@ app.post('/jobs/track', (req, res) => {
  * Body: { slug, url, mood? }
  */
 app.post('/jobs/importtrack', (req, res) => {
-  const { slug, url, mood } = req.body || {};
+  const { slug, url, mood, target_lufs } = req.body || {};
   if (!slug || !url) return res.status(400).json({ error: 'slug and url are required' });
-  const job = startJob('importtrack', { slug }, (j) => makeImportTrack(j, { slug, url, mood }));
+  const job = startJob('importtrack', { slug },
+    (j) => makeImportTrack(j, { slug, url, mood, target_lufs }));
   res.status(202).json({ job_id: job.id, status: job.status });
 });
 
