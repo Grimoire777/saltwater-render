@@ -1708,6 +1708,40 @@ async function renderSession(job, input) {
     if (!fs.existsSync(l)) throw new Error(`visual loop missing: ${l}`);
   }
 
+  /*
+   * Make room before writing three gigabytes onto a four-and-a-half gigabyte
+   * volume.
+   *
+   * This is here because the nightly run failed with "no space left on device"
+   * an hour after thirty fal source clips landed on the same volume — each of
+   * them 25 MB that no render will ever read, because sessions play the loop.
+   * A render that discovers the disk is full does so two minutes in, with a
+   * half-written file that then sits there taking up the space the next
+   * attempt needs. The failure compounds.
+   *
+   * So: check first, and if the headroom is not there, drop the two things
+   * that are safe to drop — orphaned renders of any age, and fal sources.
+   * Loops and tracks are the library and are never touched. Only runs when
+   * the disk is actually short, so a healthy volume keeps its sources and
+   * /jobs/reloop keeps working.
+   */
+  const projectedGb = (duration / 7200) * 3.3;
+  const diskBefore = await diskUsage();
+  if (Number.isFinite(diskBefore.avail_gb) && diskBefore.avail_gb < projectedGb + 0.4) {
+    step(job, `only ${diskBefore.avail_gb} GB free and this render needs about `
+      + `${projectedGb.toFixed(1)} GB - sweeping`);
+    const swept = await sweepVolume({ sources: true, renders: true, tmp: true, older_than_days: 0 });
+    step(job, `freed ${swept.freed_mb} MB from ${swept.candidates} files, `
+      + `${swept.disk_after.avail_gb} GB free now`);
+    if (Number.isFinite(swept.disk_after.avail_gb)
+      && swept.disk_after.avail_gb < projectedGb + 0.2) {
+      throw new Error(`not enough disk for a ${Math.round(duration / 60)} min render: `
+        + `${swept.disk_after.avail_gb} GB free, needs about ${projectedGb.toFixed(1)} GB. `
+        + `Loops ${swept.assets.loops.mb} MB, tracks ${swept.assets.tracks.mb} MB, `
+        + `renders ${swept.assets.renders.mb} MB. Grow the volume or shorten the session.`);
+    }
+  }
+
   const tracks = (input.tracks || []).map((t) => path.join(DIRS.tracks, `${slugSafe(t)}.mp3`));
   if (!tracks.length) throw new Error('no tracks supplied');
   for (const t of tracks) {
@@ -2698,6 +2732,104 @@ async function pruneRenders(days) {
   return removed;
 }
 
+/**
+ * What is on the volume, by directory, in bytes.
+ *
+ * Cheap enough to run before a render. The point is to be able to say WHICH
+ * directory filled the disk rather than only that it is full — "no space left
+ * on device" out of ffmpeg names the symptom and nothing else.
+ */
+async function dirSize(dir) {
+  const entries = await fsp.readdir(dir).catch(() => []);
+  let bytes = 0;
+  let count = 0;
+  for (const name of entries) {
+    const stat = await fsp.stat(path.join(dir, name)).catch(() => null);
+    if (stat && stat.isFile()) { bytes += stat.size; count += 1; }
+  }
+  return { bytes, count };
+}
+
+async function assetBreakdown() {
+  const out = {};
+  for (const [name, dir] of Object.entries(DIRS)) {
+    const { bytes, count } = await dirSize(dir);
+    out[name] = { files: count, mb: +(bytes / 1048576).toFixed(1) };
+  }
+  return out;
+}
+
+/**
+ * Delete what a render does not need.
+ *
+ * Three things accumulate on a 4.5 GB volume that a two-hour render needs
+ * 3.2 GB of:
+ *
+ *   renders   A finished session is deleted after it uploads. One that FAILS
+ *             is not, and it is the largest single file the service makes.
+ *             The old prune only removed renders older than two days, which
+ *             is no help at all when the render that just failed is the thing
+ *             filling the disk.
+ *   visuals   The fal source clips. 25 MB each against an 8 MB loop, and the
+ *             loop is what every session actually plays. Thirty beaches put
+ *             three quarters of a gigabyte here that no render reads.
+ *   tmp       Whatever ffmpeg left behind.
+ *
+ * Loops and tracks are never touched: those are the library.
+ *
+ * Dropping a source costs exactly one thing — /jobs/reloop can no longer
+ * rebuild that clip, because it re-encodes from the source. That matters if
+ * the burned-in mark changes. keep_sources holds them; older_than_days keeps
+ * anything recent.
+ */
+async function sweepVolume(opts) {
+  const o = opts || {};
+  const dry = Boolean(o.dry_run);
+  const days = Number.isFinite(Number(o.older_than_days)) ? Number(o.older_than_days) : 0;
+  const cutoff = Date.now() - days * 86400000;
+
+  const before = await diskUsage();
+  const plan = [];
+
+  const sweepDir = async (dir, label, exts) => {
+    const entries = await fsp.readdir(dir).catch(() => []);
+    for (const name of entries) {
+      if (exts && !exts.some((e) => name.endsWith(e))) continue;
+      const full = path.join(dir, name);
+      const stat = await fsp.stat(full).catch(() => null);
+      if (!stat || !stat.isFile()) continue;
+      if (stat.mtimeMs >= cutoff) continue;
+      plan.push({ what: label, name, mb: +(stat.size / 1048576).toFixed(1), full });
+    }
+  };
+
+  if (o.renders !== false) await sweepDir(DIRS.renders, 'render', ['.mp4']);
+  if (o.sources !== false) await sweepDir(DIRS.visuals, 'source', ['.mp4']);
+  if (o.tmp !== false) await sweepDir(DIRS.tmp, 'tmp', null);
+
+  let freed = 0;
+  const removed = [];
+  if (!dry) {
+    for (const item of plan) {
+      await fsp.rm(item.full, { force: true });
+      freed += item.mb;
+      removed.push(`${item.what}:${item.name}`);
+    }
+  }
+
+  return {
+    dry_run: dry,
+    older_than_days: days,
+    candidates: plan.length,
+    would_free_mb: +plan.reduce((a, b) => a + b.mb, 0).toFixed(1),
+    freed_mb: +freed.toFixed(1),
+    removed: dry ? plan.map((p) => `${p.what}:${p.name}`) : removed,
+    disk_before: before,
+    disk_after: dry ? before : await diskUsage(),
+    assets: await assetBreakdown(),
+  };
+}
+
 async function diskUsage() {
   try {
     const { stdout } = await run('df', ['-Pk', DATA_DIR], { timeoutMs: 10000 });
@@ -3593,6 +3725,31 @@ app.post('/jobs/flatten', (req, res) => {
       });
     }
     return { flattened: done };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Free space on demand.
+ *
+ * Body, all optional:
+ *   { dry_run: true }          list what would go, delete nothing
+ *   { older_than_days: 7 }     keep anything newer (default 0 = everything)
+ *   { sources: false }         keep the fal source clips
+ *   { renders: false }         keep orphaned renders
+ *   { tmp: false }             keep the scratch directory
+ *
+ * Loops and tracks are never candidates. Start with a dry run.
+ */
+app.post('/jobs/sweep', (req, res) => {
+  const b = req.body || {};
+  const job = startJob('sweep', { dry_run: Boolean(b.dry_run) }, async (j) => {
+    const out = await sweepVolume(b);
+    step(j, out.dry_run
+      ? `${out.candidates} files could go, ${out.would_free_mb} MB`
+      : `removed ${out.candidates} files, freed ${out.freed_mb} MB, `
+        + `${out.disk_after.avail_gb} GB free`);
+    return out;
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
