@@ -2063,6 +2063,123 @@ function captionLines(raw) {
     .slice(0, 4);
 }
 
+/**
+ * How wide a line of text actually is, in pixels, measured rather than guessed.
+ *
+ * This exists because a caption ran off both edges of a published Short:
+ * "Let your body become heavier with every breath" is 1312 px at 54 px on this
+ * font, on a frame 1080 px wide. drawtext centres on `text_w` and will happily
+ * centre something wider than the canvas, so the ends simply leave the screen
+ * and nothing anywhere reports a problem.
+ *
+ * Estimating from an average glyph width was the tempting fix and is wrong for
+ * exactly the lines that matter: an italic serif varies more than 3:1 between
+ * 'i' and 'm', so the estimate is comfortably right on ordinary lines and
+ * wrong on the long ones. So ffmpeg draws the text on an oversized black
+ * canvas and `cropdetect` reports the ink extent. It is the same renderer that
+ * will draw the real thing, which is the only measurement worth having.
+ *
+ * A failed measurement returns null and the caller leaves the line alone —
+ * a Short with an unwrapped caption is worse than one with a wrapped one, but
+ * both are better than no Short.
+ */
+const inkWidthCache = new Map();
+async function measureInkWidth(text, size) {
+  const font = findFont();
+  if (!font || !String(text).trim()) return null;
+  const key = `${size}|${text}`;
+  if (inkWidthCache.has(key)) return inkWidthCache.get(key);
+
+  const f = path.join(DIRS.tmp,
+    `measure_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}.txt`);
+  let width = null;
+  try {
+    await fsp.writeFile(f, String(text), 'utf8');
+    // -v info, not the usual -v error: cropdetect reports on the info channel,
+    // so the quiet default that every other call here wants would throw the
+    // measurement away.
+    const { stderr } = await run('ffmpeg', ['-y', '-v', 'info',
+      '-f', 'lavfi', '-i', 'color=black:s=6000x400:d=1:r=5',
+      '-vf', `drawtext=fontfile=${font}:textfile=${f}:fontcolor=white`
+        + `:fontsize=${size}:x=200:y=120,cropdetect`,
+      '-frames:v', '3', '-f', 'null', '-'], { timeoutMs: 30000 });
+    // On a short line cropdetect reports a negative height - it finds no
+    // vertical run to trim - so the pattern has to allow a minus sign or the
+    // measurement silently comes back null for exactly the lines that fit.
+    const hits = String(stderr).match(/crop=-?\d+:-?\d+:-?\d+:-?\d+/g) || [];
+    const last = hits[hits.length - 1];
+    if (last) {
+      const m = last.match(/crop=(-?\d+):(-?\d+):(-?\d+):(-?\d+)/);
+      const ink = Number(m[1]);
+      const leftBearing = Math.max(0, Number(m[3]) - 200);
+      // Ink is not advance width: the pen starts left of the first mark and an
+      // italic overhangs the last one. Pad by an eighth of the size so the fit
+      // test is the pessimistic one.
+      if (Number.isFinite(ink) && ink > 0) {
+        width = ink + leftBearing + Math.round(size * 0.12);
+      }
+    }
+  } catch (err) {
+    width = null;
+  }
+  await fsp.rm(f, { force: true }).catch(() => {});
+  inkWidthCache.set(key, width);
+  return width;
+}
+
+/** Greedy word wrap against a measured width. One word too wide is left alone. */
+async function wrapToWidth(line, size, maxWidth) {
+  const full = await measureInkWidth(line, size);
+  if (full === null || full <= maxWidth) return [line];
+  const words = String(line).split(/\s+/).filter(Boolean);
+  if (words.length < 2) return [line];
+
+  const out = [];
+  let cur = '';
+  for (const word of words) {
+    const candidate = cur ? `${cur} ${word}` : word;
+    const w = await measureInkWidth(candidate, size);
+    if (w !== null && w > maxWidth && cur) { out.push(cur); cur = word; } else { cur = candidate; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/**
+ * Turn a caption into lines that fit, shrinking the type only when wrapping
+ * alone cannot do it.
+ *
+ * Wrapping first and shrinking second is deliberate. Type size is a house
+ * decision — 54 px was chosen by looking at a real frame — and a caption that
+ * quietly renders at 38 px because it is long is a different design every
+ * night. Line count is the cheaper thing to spend: the tip sits in open sky
+ * with room for three lines, the call to action has two before it collides
+ * with YouTube's own rail.
+ */
+async function layoutCaption(raw, size, maxWidth, maxLines) {
+  const explicit = captionLines(raw);
+  if (!explicit.length) return { lines: [], size: size };
+
+  let s = size;
+  let best = { lines: explicit, size: s };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const lines = [];
+    for (const line of explicit) {
+      for (const piece of await wrapToWidth(line, s, maxWidth)) lines.push(piece);
+    }
+    let widest = 0;
+    for (const line of lines) {
+      const w = await measureInkWidth(line, s);
+      if (w !== null && w > widest) widest = w;
+    }
+    best = { lines: lines, size: s };
+    if (lines.length <= maxLines && widest <= maxWidth) return best;
+    if (s <= 32) return best;
+    s = Math.max(32, Math.round(s * 0.88));
+  }
+  return best;
+}
+
 function drawTextClause(file, size, yExpr, alphaExpr) {
   return [
     `drawtext=fontfile=${findFont()}`,
@@ -2270,9 +2387,14 @@ async function renderShort(job, input) {
     // Positioning each line explicitly costs nothing, removes the control
     // character entirely rather than hoping the next ffmpeg handles it, and
     // makes the line spacing an actual number instead of a font metric.
+    // The widest a caption may be. 1080 minus a 56 px margin each side: the
+    // margin is not decoration, it is what stops a line from touching the edge
+    // of a phone screen and reading as cut off even when every glyph is
+    // present.
+    const TEXT_MAX_W = W - 112;
+
     let n = 0;
-    const drawLines = async (raw, size, topExpr, alphaExpr, tag) => {
-      const lines = captionLines(raw);
+    const drawLines = async (lines, size, topExpr, alphaExpr, tag) => {
       const lead = Math.round(size * 1.34);
       for (let i = 0; i < lines.length; i += 1) {
         const f = path.join(DIRS.tmp, `${runId}_${tag}${i}.txt`);
@@ -2292,9 +2414,13 @@ async function renderShort(job, input) {
       // phone and deliberately not more than that. Large type on a sleep video
       // is the visual equivalent of raising your voice, and the picture is
       // supposed to be the thing being looked at.
-      const lines = await drawLines(tip, TIP_SIZE, 'h*0.10',
+      //
+      // Three lines allowed here: at 54 px the tip starts at y=192 and three
+      // lines stand 217 px, finishing well above the picture's own interest.
+      const fit = await layoutCaption(tip, TIP_SIZE, TEXT_MAX_W, 3);
+      const lines = await drawLines(fit.lines, fit.size, 'h*0.10',
         textAlpha(0.6, handover + 0.8, 1.2, 0.94), 'tip');
-      step(job, `tip: ${JSON.stringify(lines)}`);
+      step(job, `tip at ${fit.size}px in ${lines.length} line(s): ${JSON.stringify(lines)}`);
     }
     if (cta) {
       // The offer sits low, near where the link to the full video appears —
@@ -2303,9 +2429,13 @@ async function renderShort(job, input) {
       // Two lines of 54px stand about 145px, so 0.72 lands the bottom around
       // 1530. It starts fading in while the instruction is still leaving, so
       // the frame is never empty and never carries both messages at once.
-      const lines = await drawLines(cta, CTA_SIZE, 'h*0.72',
+      //
+      // Two lines, hard. A third would push past y=1540 into YouTube's own
+      // furniture, so a long call to action shrinks rather than growing.
+      const fit = await layoutCaption(cta, CTA_SIZE, TEXT_MAX_W, 2);
+      const lines = await drawLines(fit.lines, fit.size, 'h*0.72',
         textAlpha(handover, seconds - 0.4, 1.2, 0.90), 'cta');
-      step(job, `cta: ${JSON.stringify(lines)}`);
+      step(job, `cta at ${fit.size}px in ${lines.length} line(s): ${JSON.stringify(lines)}`);
     }
     step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
