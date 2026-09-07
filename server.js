@@ -245,6 +245,33 @@ async function probeDuration(file) {
 }
 
 /**
+ * How long the audio track itself runs, which is not the same as how long the
+ * file runs.
+ *
+ * A render whose music ran out early still reports the full duration on the
+ * container and still has an audio stream — it is simply silent at the end.
+ * Both of the checks in verify() passed on a reel with four seconds of nothing
+ * at the end of it, and the person watching found it instead. This is the
+ * measurement that would have caught it.
+ *
+ * Returns null rather than throwing when the stream carries no duration of its
+ * own, which some containers do: a missing measurement must not fail a render
+ * that is otherwise fine.
+ */
+async function probeAudioDuration(file) {
+  try {
+    const { stdout } = await run('ffprobe', [
+      '-v', 'error', '-select_streams', 'a:0',
+      '-show_entries', 'stream=duration', '-of', 'csv=p=0', file,
+    ], { timeoutMs: 60000 });
+    const seconds = Number(String(stdout).trim());
+    return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
  * Mean level of a slice of audio, in dBFS.
  *
  * volumedetect reports on stderr, so this calls ffmpeg directly rather than
@@ -2082,7 +2109,6 @@ async function renderShort(job, input) {
 
   const outPath = path.join(DIRS.renders, `${runId}.mp4`);
   const startAt = Number(input.audio_start_sec);
-  const seek = Number.isFinite(startAt) ? startAt : 40;
   let seconds = clampNum(Number(input.seconds), 10, 180, 40);
 
   // Snap the length to a whole number of visual loop cycles.
@@ -2094,16 +2120,89 @@ async function renderShort(job, input) {
   // Shorts feed loops it, the picture jumps. That is a real visible fault at
   // the seam and the sort of thing that reads as "something happened at the
   // end" without being nameable.
+  //
+  // But it is not the only thing that matters, which is why it is now a
+  // choice. The beach loops are 18.53s, so snapping a 30-second ask rounds it
+  // UP to 37.07 — and on Instagram a reel that crosses thirty seconds loses the
+  // shorter-video treatment the feed gives clips under it. Trading four seconds
+  // of length for an invisible seam is a good deal; trading the format's
+  // completion behaviour for it may not be. `snap: false` renders exactly what
+  // was asked for.
+  //
+  // What that costs is honest and small: one step in the picture at the moment
+  // the feed replays, on footage that is already drifting slowly. The audio is
+  // unaffected either way — the bed is far longer than the clip and never wraps.
+  const snap = input.snap === undefined ? true : Boolean(input.snap);
   const loopSeconds = await probeDuration(loopPath).catch(() => 0);
   if (loopSeconds > 1) {
     const cycles = Math.max(1, Math.round(seconds / loopSeconds));
     const snapped = Math.round(cycles * loopSeconds * 1000) / 1000;
-    if (Math.abs(snapped - seconds) > 0.05) {
+    if (!snap) {
+      const part = seconds / loopSeconds;
+      const off = Math.abs(part - Math.round(part));
+      step(job, `holding ${seconds}s exactly (snap off) — `
+        + `${part.toFixed(2)} x the ${loopSeconds.toFixed(2)}s picture loop`
+        + (off > 0.05
+          ? ', so the picture steps once where the feed replays it'
+          : ', which happens to land on a whole cycle anyway'));
+    } else if (Math.abs(snapped - seconds) > 0.05) {
       step(job, `snapping ${seconds}s to ${snapped}s — `
         + `${cycles} x the ${loopSeconds.toFixed(2)}s picture loop, so it repeats seamlessly`);
       seconds = snapped;
     }
   }
+  /*
+   * Make sure there is actually enough music to reach the end.
+   *
+   * This shipped broken. The bed is seeked into by `audio_start_sec` — 40s by
+   * default, because the opening of an ambient track is near-silence and makes
+   * a dead first second — and then cut to `seconds`. Nothing checked that the
+   * bed was long enough to survive both. A 75-second bed seeked to 40 has 35
+   * seconds left; the clip was 37; the last two seconds had no audio at all,
+   * and the bed's own fade-out made the two before that nearly silent. Four
+   * seconds of silence at the end of a 37-second reel, reported by Jack, and
+   * invisible to every check the pipeline had.
+   *
+   * The seek is a preference, not a requirement, so it gives way: pull it back
+   * far enough that the clip fits inside the bed. Only when the bed is shorter
+   * than the whole clip does the audio have to wrap, and then it says so.
+   *
+   * Computed after the length is settled, because snapping can lengthen it —
+   * checking before the snap would have passed this exact render.
+   */
+  const trackSeconds = await probeDuration(trackPath).catch(() => 0);
+  let seek = Number.isFinite(startAt) ? startAt : 40;
+  let loopAudio = false;
+  if (trackSeconds > 1) {
+    if (trackSeconds <= seconds + 0.25) {
+      seek = 0;
+      loopAudio = true;
+      step(job, `the bed is ${trackSeconds.toFixed(1)}s against a ${seconds}s clip `
+        + '— looping it from the start, so it wraps once');
+    } else {
+      // Stay three seconds clear of the end, not just inside it.
+      //
+      // Beds are generated with their own fade-out — the session renderer
+      // trims those off before joining, and nothing here does. Landing the
+      // clip on the bed's last second would put that fade under the render's
+      // own two-second fade and the music would sound like it died early,
+      // which is the same complaint as running out, only quieter.
+      //
+      // The guard can only ever pull the seek back, never past zero, so it
+      // cannot cause the overrun it exists to prevent.
+      const TAIL_GUARD = 3;
+      const maxSeek = Math.max(0, trackSeconds - seconds - TAIL_GUARD);
+      if (seek > maxSeek) {
+        const short = seek + seconds - trackSeconds;
+        step(job, `audio_start_sec ${seek}s ${short > 0
+          ? `would run a ${trackSeconds.toFixed(1)}s bed out ${short.toFixed(1)}s early`
+          : `leaves no room before the end of a ${trackSeconds.toFixed(1)}s bed`}`
+          + ` — starting at ${maxSeek.toFixed(1)}s instead`);
+        seek = maxSeek;
+      }
+    }
+  }
+
   const W = 1080;
   const H = 1920;
 
@@ -2277,29 +2376,35 @@ async function renderShort(job, input) {
 
   const fadeOut = Math.max(0, seconds - 2);
   step(job, `cutting a ${seconds}s vertical short${font ? ' with captions' : ''}`);
+  // Built as one array rather than spliced together from three. Splicing is
+  // how `ambience_slug` and `music_start_sec` each went missing from a session
+  // job without anything erroring.
+  const args = ['-stream_loop', '-1', '-i', loopPath];
+  if (loopAudio) args.push('-stream_loop', '-1');
+  args.push('-ss', String(seek), '-t', String(seconds), '-i', trackPath);
+  // The scrims as still images.
+  //
+  // They were the `gradients` lavfi source first, which is correct and
+  // unusably slow: as a live source it recomputes the ramp for every frame of
+  // the Short, and a three-second test had not finished after five minutes. As
+  // a single PNG each takes 0.08s to make once and costs an ordinary overlay
+  // thereafter.
+  args.push('-loop', '1', '-i', scrims.top);
+  args.push('-loop', '1', '-i', scrims.bottom);
+  if (drawMark) args.push('-loop', '1', '-i', LOCKUP_PATH);
+  args.push(
+    '-t', String(seconds),
+    '-filter_complex', parts.join(';'),
+    '-map', '[v]', '-map', '1:a:0',
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+    '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`,
+    '-movflags', '+faststart',
+    outPath,
+  );
+
   try {
-    await ffmpeg([
-      '-stream_loop', '-1', '-i', loopPath,
-      '-ss', String(seek), '-t', String(seconds), '-i', trackPath,
-      // The scrims as still images, inputs 2 and 3.
-      //
-      // They were the `gradients` lavfi source first, which is correct and
-      // unusably slow: as a live source it recomputes the ramp for every frame
-      // of the Short, and a three-second test had not finished after five
-      // minutes. As a single PNG each takes 0.08s to make once and costs an
-      // ordinary overlay thereafter.
-      '-loop', '1', '-i', scrims.top,
-      '-loop', '1', '-i', scrims.bottom,
-    ].concat(drawMark ? ['-loop', '1', '-i', LOCKUP_PATH] : []).concat([
-      '-t', String(seconds),
-      '-filter_complex', parts.join(';'),
-      '-map', '[v]', '-map', '1:a:0',
-      '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30',
-      '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-      '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`,
-      '-movflags', '+faststart',
-      outPath,
-    ]), { timeoutMs: 20 * 60 * 1000 });
+    await ffmpeg(args, { timeoutMs: 20 * 60 * 1000 });
   } finally {
     for (const f of written) await fsp.rm(f, { force: true });
   }
@@ -2320,7 +2425,19 @@ async function verify(job, file, targetSeconds) {
   if (!streams.includes('audio')) throw new Error('render has no audio stream');
   if (drift > 0.05) throw new Error(`duration drift ${(drift * 100).toFixed(1)}% (${duration.toFixed(1)}s vs ${targetSeconds}s)`);
 
-  step(job, `verified ${(stat.size / 1048576).toFixed(0)} MB, ${duration.toFixed(0)}s`);
+  // "Has an audio stream" is not "has audio all the way to the end". A reel
+  // shipped with four silent seconds at the end because the bed ran out, and
+  // every check above passed on it. One second of tolerance covers encoder
+  // rounding; anything more is music that stopped before the picture did.
+  const audioSeconds = await probeAudioDuration(file);
+  if (audioSeconds !== null && duration - audioSeconds > 1) {
+    throw new Error(`audio stops ${(duration - audioSeconds).toFixed(1)}s before the end `
+      + `(${audioSeconds.toFixed(1)}s of sound in a ${duration.toFixed(1)}s file) — `
+      + 'the bed was too short, or audio_start_sec seeked too far into it');
+  }
+
+  step(job, `verified ${(stat.size / 1048576).toFixed(0)} MB, ${duration.toFixed(0)}s`
+    + (audioSeconds === null ? '' : `, audio to ${audioSeconds.toFixed(0)}s`));
   return { bytes: stat.size, duration_sec: Math.round(duration) };
 }
 
