@@ -4047,11 +4047,30 @@ app.post('/jobs/repatch', (req, res) => {
       // Generous on both counts, because the feather is consumed from the
       // inside: the mask is only fully opaque up to about a feather and a half
       // short of its own edge, so the patch has to start well clear of the ink.
-      const py = Math.max(0, box.y - box.h);
-      const pw = Math.min(dims.w, box.x + box.w + Math.round(box.w * 0.8));
-      const ph = dims.h - py;
+      //
+      // BOTH DIMENSIONS MUST BE EVEN. The mask is made by lavfi's `color`
+      // source, which emits yuv420p, and yuv420p cannot represent an odd
+      // height - it silently rounds down. Ask for 700x429 and you get 700x428,
+      // and alphamerge then refuses the pair with "Input frame sizes do not
+      // match". This cost a run: the local ffmpeg (6) accepted the mismatched
+      // pair and the deployed one (8) did not, so it looked right here and
+      // failed on Railway. The same lesson as the drawtext newline - the local
+      // ffmpeg is not the deployed ffmpeg. Rounding the top edge up by a pixel
+      // only makes the patch taller, which is the safe direction.
+      const rawPy = Math.max(0, box.y - box.h);
+      const py = rawPy - (rawPy % 2);
+      const ph = (dims.h - py) - ((dims.h - py) % 2);
+      const rawPw = Math.min(dims.w, box.x + box.w + Math.round(box.w * 0.8));
+      const pw = rawPw - (rawPw % 2);
       const feather = Math.round(box.w * 0.26);
       const mask = await ensurePatchMask(pw, ph, feather);
+      // Checked rather than assumed: the failure downstream is a filter-graph
+      // error that names neither the mask nor the file being patched.
+      const mdim = await probeVideoSize(mask);
+      if (!mdim || mdim.w !== pw || mdim.h !== ph) {
+        throw new Error(`patch mask is ${mdim ? `${mdim.w}x${mdim.h}` : 'unreadable'}`
+          + ` but the patch is ${pw}x${ph} - refusing to build a mismatched graph`);
+      }
       const out = path.join(DIRS.tmp, `${slug}_repatch.mp4`);
       const blur = Math.max(10, Math.round(box.h * 0.14));
       // A vertical loop gets the old mark taken OFF and nothing put back.
