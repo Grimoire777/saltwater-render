@@ -1472,6 +1472,39 @@ async function makeImportVisual(job, { slug, aspect, url, dim, vivid, start, sou
   };
 }
 
+/**
+ * Read a line aloud.
+ *
+ * Same key as the music, a different endpoint and a different order of cost:
+ * music bills around 900 credits a minute, speech around one credit a
+ * character, so a 150-character beat is roughly 150 credits against 3,600 for
+ * a four-minute bed. That difference is the whole reason the voice is
+ * affordable on a plan that is being wound down.
+ *
+ * Returns null rather than throwing when there is no voice configured, so a
+ * Short without narration is still a Short.
+ */
+async function speak(job, { text, voice_id, out }) {
+  const vid = String(voice_id || SHORT_VOICE_ID || '').trim();
+  if (!vid || !String(text || '').trim()) return null;
+  step(job, `speaking ${String(text).length} characters in voice ${vid}`);
+  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}`, {
+    method: 'POST',
+    headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text: String(text),
+      model_id: 'eleven_multilingual_v2',
+      output_format: 'mp3_44100_128',
+      // Stability high and style at zero on purpose: this is a sleep channel,
+      // and an expressive read is the wrong instrument entirely.
+      voice_settings: { stability: 0.70, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+    }),
+  });
+  if (!res.ok) throw new Error(`elevenlabs tts ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  await fsp.writeFile(out, Buffer.from(await res.arrayBuffer()));
+  return out;
+}
+
 /** Generate a music bed on ElevenLabs and loudness-match it to the rest. */
 async function makeTrack(job, { slug, prompt, length_ms, target_lufs }) {
   const safe = slugSafe(slug);
@@ -2143,6 +2176,28 @@ const TIP_SIZE = clampNum(Number(process.env.SHORT_TIP_SIZE), 28, 120, 54);
 // a footnote to the first, and it is not a footnote — the two beats are equal
 // halves of the same message, one after the other, in the same voice.
 const CTA_SIZE = clampNum(Number(process.env.SHORT_CTA_SIZE), 24, 120, TIP_SIZE);
+// The place line at the top runs for the whole clip and is the quietest thing
+// on screen, so it sits below the quote in size.
+const PLACE_SIZE = clampNum(Number(process.env.SHORT_PLACE_SIZE), 20, 90, 40);
+
+/*
+ * Pale sand, not white.
+ *
+ * Jack's pick off a four-way render on a real frame, and the reasoning holds
+ * up: this is watched on a phone, in the dark, in bed. Pure white is the
+ * brightest and coolest thing a screen emits - the exact thing every night
+ * mode on every device exists to move away from - and warming it a few percent
+ * drops the glare while still reading as white at a glance. It also separates
+ * from the picture for free: every scene in this library is cool, blue water
+ * under a blue night, and warm type sits forward of a cool image without
+ * having to be brighter.
+ */
+const TEXT_COLOR = String(process.env.SHORT_TEXT_COLOR || '#E6D3B3');
+
+// A calm female read. Overridable per job, because the right voice is a
+// judgement made by listening rather than a value to derive - GET /voices
+// lists what the account actually has.
+const SHORT_VOICE_ID = String(process.env.SHORT_VOICE_ID || '');
 
 /**
  * The two gradient scrims, built once and kept in tmp.
@@ -2381,11 +2436,11 @@ async function layoutCaption(raw, size, maxWidth, maxLines) {
   return best;
 }
 
-function drawTextClause(file, size, yExpr, alphaExpr) {
+function drawTextClause(file, size, yExpr, alphaExpr, colour) {
   return [
     `drawtext=fontfile=${findFont()}`,
     `textfile=${file}`,
-    'fontcolor=white',
+    `fontcolor=${colour || TEXT_COLOR}`,
     `alpha=${alphaExpr}`,
     `fontsize=${size}`,
     'line_spacing=16',
@@ -2572,73 +2627,92 @@ async function renderShort(job, input) {
   if (!font) {
     step(job, 'no font on this image — rendering the short without captions');
   } else {
-    const tip = String(input.tip || input.hook || '').trim();
+    /*
+     * Three things on screen, each with its own job.
+     *
+     *   top     where this is - the beach and the country, held for the whole
+     *           clip, because a viewer who scrolls past should still know they
+     *           were somewhere real
+     *   middle  the quote, split into beats and read aloud
+     *   bottom  the offer, arriving only in the last ten seconds
+     *
+     * The beats are supplied already split. The renderer times and fits them;
+     * it does not decide where a sentence breaks, because that is a judgement
+     * about writing and it belongs with the writing.
+     */
+    const place = String(input.place || '').trim();
     const cta = String(input.cta || '').trim();
-    const handover = clampNum(Number(input.handover_sec), 3,
-      Math.max(4, seconds - 4), 10);
+    const rawBeats = Array.isArray(input.beats) ? input.beats : null;
+    const beats = (rawBeats || [])
+      .map((b) => String(b).replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
 
-    // One drawtext per line, never a newline inside the text.
-    //
-    // A multi-line caption used to be a single drawtext with "\n" in it, which
-    // is the obvious way to do it and rendered perfectly on ffmpeg 6. On the
-    // ffmpeg 8 in this image the text shaper maps that newline to a .notdef
-    // glyph — so the line still breaks AND a small empty box appears at the
-    // end of it. It shipped in the first real Short.
-    //
-    // Positioning each line explicitly costs nothing, removes the control
-    // character entirely rather than hoping the next ffmpeg handles it, and
-    // makes the line spacing an actual number instead of a font metric.
-    // The widest a caption may be. 1080 minus a 56 px margin each side: the
-    // margin is not decoration, it is what stops a line from touching the edge
-    // of a phone screen and reading as cut off even when every glyph is
-    // present.
+    // The old single-tip shape still works, so WF-B keeps running while the
+    // quote format is being wired up.
+    const tip = String(input.tip || input.hook || '').trim();
+    if (!beats.length && tip) beats.push(tip);
+
     const TEXT_MAX_W = W - 112;
 
     let n = 0;
-    const drawLines = async (lines, size, topExpr, alphaExpr, tag) => {
-      const lead = Math.round(size * 1.34);
-      for (let i = 0; i < lines.length; i += 1) {
-        const f = path.join(DIRS.tmp, `${runId}_${tag}${i}.txt`);
-        await fsp.writeFile(f, lines[i], 'utf8');
-        written.push(f);
-        n += 1;
-        const y = i === 0 ? topExpr : `${topExpr}+${i * lead}`;
-        parts.push(`${last}${drawTextClause(f, size, y, alphaExpr)}[x${n}]`);
-        last = `[x${n}]`;
-      }
-      return lines;
+    const drawOne = async (text, size, yExpr, alphaExpr, tag) => {
+      const f = path.join(DIRS.tmp, `${runId}_${tag}.txt`);
+      await fsp.writeFile(f, text, 'utf8');
+      written.push(f);
+      n += 1;
+      parts.push(`${last}${drawTextClause(f, size, yExpr, alphaExpr)}[x${n}]`);
+      last = `[x${n}]`;
     };
 
-    if (tip) {
-      // The instruction sits in the dark band above the picture, at reading
-      // height. 54px is about 5% of the frame width — plainly readable on a
-      // phone and deliberately not more than that. Large type on a sleep video
-      // is the visual equivalent of raising your voice, and the picture is
-      // supposed to be the thing being looked at.
-      //
-      // Three lines allowed here: at 54 px the tip starts at y=192 and three
-      // lines stand 217 px, finishing well above the picture's own interest.
-      const fit = await layoutCaption(tip, TIP_SIZE, TEXT_MAX_W, 3);
-      const lines = await drawLines(fit.lines, fit.size, 'h*0.10',
-        textAlpha(0.6, handover + 0.8, 1.2, 0.94), 'tip');
-      step(job, `tip at ${fit.size}px in ${lines.length} line(s): ${JSON.stringify(lines)}`);
+    // ------------------------------------------------------------ the place
+    if (place) {
+      const fit = await layoutCaption(place, PLACE_SIZE, TEXT_MAX_W, 1);
+      await drawOne(fit.lines.join(' '), fit.size, 'h*0.085',
+        textAlpha(0.4, seconds - 0.5, 1.4, 0.88), 'place');
+      step(job, `place: ${JSON.stringify(fit.lines.join(' '))} at ${fit.size}px`);
     }
+
+    // ------------------------------------------------------------ the quote
+    //
+    // Beats share the clip evenly. Three sentences over thirty seconds is ten
+    // seconds each, which is long enough to read a line twice and short enough
+    // that nothing sits still - and each one drifts slowly upward while it is
+    // up, so the screen is never quite static.
+    const ctaHold = clampNum(Number(input.cta_sec ?? input.handover_sec), 4,
+      Math.max(5, seconds - 4), 10);
+    const ctaAt = Math.max(0, seconds - ctaHold);
+
+    if (beats.length) {
+      const per = seconds / beats.length;
+      const FADE = 1.1;
+      for (let bi = 0; bi < beats.length; bi += 1) {
+        const fit = await layoutCaption(beats[bi], TIP_SIZE, TEXT_MAX_W, 3);
+        const lead = Math.round(fit.size * 1.5);
+        const block = fit.lines.length * lead;
+        const t0 = bi * per;
+        const t1 = t0 + per;
+        const al = textAlpha(t0 + 0.15, t1 - 0.15, FADE, 0.95);
+        for (let li = 0; li < fit.lines.length; li += 1) {
+          const y = `(h*0.46-${Math.round(block / 2)})+${li * lead}`
+            + `-26*(t-${t0.toFixed(2)})/${per.toFixed(2)}`;
+          await drawOne(fit.lines[li], fit.size, y, al, `b${bi}_${li}`);
+        }
+        step(job, `beat ${bi + 1}/${beats.length} at ${fit.size}px, `
+          + `${fit.lines.length} line(s), ${t0.toFixed(0)}-${t1.toFixed(0)}s: `
+          + JSON.stringify(fit.lines));
+      }
+    }
+
+    // ------------------------------------------------------------ the offer
     if (cta) {
-      // The offer sits low, near where the link to the full video appears —
-      // but the last line has to finish above y=1540, because YouTube's own
-      // caption, channel name and button rail cover everything below that.
-      // Two lines of 54px stand about 145px, so 0.72 lands the bottom around
-      // 1530. It starts fading in while the instruction is still leaving, so
-      // the frame is never empty and never carries both messages at once.
-      //
-      // Two lines, hard. A third would push past y=1540 into YouTube's own
-      // furniture, so a long call to action shrinks rather than growing.
       const fit = await layoutCaption(cta, CTA_SIZE, TEXT_MAX_W, 2);
-      const lines = await drawLines(fit.lines, fit.size, 'h*0.72',
-        textAlpha(handover, seconds - 0.4, 1.2, 0.90), 'cta');
-      step(job, `cta at ${fit.size}px in ${lines.length} line(s): ${JSON.stringify(lines)}`);
+      const lead = Math.round(fit.size * 1.5);
+      const al = textAlpha(ctaAt, seconds - 0.4, 1.4, 0.92);
+      for (let i = 0; i < fit.lines.length; i += 1) {
+        await drawOne(fit.lines[i], fit.size, `h*0.72+${i * lead}`, al, `cta${i}`);
+      }
+      step(job, `offer from ${ctaAt.toFixed(0)}s at ${fit.size}px: ${JSON.stringify(fit.lines)}`);
     }
-    step(job, `tip holds to ${Math.round(handover)}s, then the session line`);
   }
   /*
    * The mark is OFF on Shorts from 2026-09-06, by decision.
@@ -2705,6 +2779,40 @@ async function renderShort(job, input) {
 
   parts.push(`${last}format=yuv420p[v]`);
 
+  /*
+   * The voice.
+   *
+   * One request per beat, not one for the whole quote. The characters cost the
+   * same either way, and a single long read finishes while the second beat is
+   * still on screen - the words and the picture drift apart and the viewer
+   * notices immediately. Per beat, each line is spoken as it appears.
+   *
+   * A failed request drops that line and keeps the Short. Losing narration is
+   * a worse Short; losing the render is a lost night.
+   */
+  const speakBeats = (Array.isArray(input.beats) ? input.beats : [])
+    .map((b) => String(b).replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  const voiceId = String(input.voice_id || SHORT_VOICE_ID || '').trim();
+  const voices = [];
+  if (input.speak !== false && voiceId && speakBeats.length) {
+    const per = seconds / speakBeats.length;
+    for (let i = 0; i < speakBeats.length; i += 1) {
+      const out = path.join(DIRS.tmp, `${runId}_voice${i}.mp3`);
+      try {
+        const f = await speak(job, { text: speakBeats[i], voice_id: voiceId, out });
+        if (f) {
+          written.push(f);
+          // A second of picture before anyone speaks. Opening on a voice is
+          // startling, which is the opposite of the job.
+          voices.push({ file: f, at: i * per + 1.0 });
+        }
+      } catch (err) {
+        step(job, `voice failed on beat ${i + 1}: ${err.message} — continuing without it`);
+      }
+    }
+  }
+
   const fadeOut = Math.max(0, seconds - 2);
   step(job, `cutting a ${seconds}s vertical short${font ? ' with captions' : ''}`);
   // Built as one array rather than spliced together from three. Splicing is
@@ -2723,16 +2831,40 @@ async function renderShort(job, input) {
   args.push('-loop', '1', '-i', scrims.top);
   args.push('-loop', '1', '-i', scrims.bottom);
   if (drawMark) args.push('-loop', '1', '-i', LOCKUP_PATH);
+
+  // Voice inputs go on the end so the indices of everything before them do not
+  // move when the mark is switched off.
+  let vi = drawMark ? 5 : 4;
+  const tail = `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`;
+  if (voices.length) {
+    // The bed steps back five decibels for the whole clip rather than ducking
+    // under a sidechain. On thirty seconds of near-continuous speech a gate
+    // would be opening and closing throughout, and every one of those moves is
+    // audible on music this quiet. A constant step is inaudible.
+    const chain = [`[1:a]volume=-5dB[bed]`];
+    const labels = ['[bed]'];
+    for (let i = 0; i < voices.length; i += 1) {
+      const ms = Math.round(voices[i].at * 1000);
+      args.push('-i', voices[i].file);
+      chain.push(`[${vi + i}:a]adelay=${ms}|${ms},volume=1.6[vx${i}]`);
+      labels.push(`[vx${i}]`);
+    }
+    chain.push(`${labels.join('')}amix=inputs=${labels.length}:duration=first`
+      + `:dropout_transition=0:normalize=0[mixed]`);
+    chain.push(`[mixed]${tail}[a]`);
+    parts.push(...chain);
+    vi += voices.length;
+  }
+
   args.push(
     '-t', String(seconds),
     '-filter_complex', parts.join(';'),
-    '-map', '[v]', '-map', '1:a:0',
+    '-map', '[v]', '-map', voices.length ? '[a]' : '1:a:0',
     '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30',
     '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
-    '-af', `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`,
-    '-movflags', '+faststart',
-    outPath,
   );
+  if (!voices.length) args.push('-af', tail);
+  args.push('-movflags', '+faststart', outPath);
 
   try {
     await ffmpeg(args, { timeoutMs: 20 * 60 * 1000 });
@@ -4200,6 +4332,35 @@ app.post('/jobs/sweep', (req, res) => {
     return out;
   });
   res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * What voices this account actually has.
+ *
+ * Read-only, and here rather than guessed: ElevenLabs voice ids are opaque
+ * strings and picking one from memory is how a job ends up narrated by
+ * whoever happens to own that id.
+ */
+app.get('/voices', async (_req, res) => {
+  try {
+    const r = await fetch('https://api.elevenlabs.io/v1/voices', {
+      headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+    });
+    if (!r.ok) return res.status(502).json({ error: `elevenlabs ${r.status}`, body: (await r.text()).slice(0, 300) });
+    const j = await r.json();
+    return res.json({
+      configured: SHORT_VOICE_ID || null,
+      voices: (j.voices || []).map((v) => ({
+        voice_id: v.voice_id,
+        name: v.name,
+        category: v.category,
+        labels: v.labels || {},
+        preview_url: v.preview_url,
+      })),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/assets', async (_req, res) => {
