@@ -492,6 +492,23 @@ async function probeStreams(file) {
 }
 
 /**
+ * The pixel size of a video's first video stream, or null.
+ *
+ * Asked rather than assumed: the library holds both 1920x1080 and 1080x1920
+ * loops, the mark is placed as a percentage of the width, and patching the
+ * wrong corner of a vertical clip would be invisible until someone watched it.
+ */
+async function probeVideoSize(file) {
+  const { stdout } = await run('ffprobe', [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height', '-of', 'csv=p=0:s=x', file,
+  ], { timeoutMs: 60000 }).catch(() => ({ stdout: '' }));
+  const m = String(stdout).trim().match(/^(\d+)x(\d+)/);
+  if (!m) return null;
+  return { w: Number(m[1]), h: Number(m[2]) };
+}
+
+/**
  * What kind of file is this? Stills and clips need different treatment, and a
  * file extension is not evidence, so ask ffprobe. A still reports no usable
  * duration; anything with real running time is treated as video.
@@ -3908,6 +3925,179 @@ app.post('/jobs/reloop', (req, res) => {
       brand: brandStatus(),
       disk: await diskUsage(),
     };
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Where the mark sits on a finished loop, as pixels.
+ *
+ * The same arithmetic brandOverlay() uses, pulled out so the patcher and the
+ * marker can never disagree about where the old logo is. If the two ever drift
+ * apart the patch covers the wrong part of the frame and the fault is only
+ * visible by watching the video.
+ */
+function markBox(w, h) {
+  const isWide = w >= h;
+  const pct = Number(process.env.BRAND_WIDTH_PCT ?? (isWide ? 0.18 : 0.30));
+  const markW = Math.max(80, Math.round(w * clamp01(pct)));
+  // The lockup art is 947x482. Height follows from the width because ffmpeg
+  // scales it -1, and the patch has to know how tall the result will be.
+  const markH = Math.round(markW * (482 / 947));
+  const margin = Math.round(w * BRAND_MARGIN_PCT);
+  const x = BRAND_CORNER.indexOf('l') !== -1 ? margin : w - markW - margin;
+  const y = BRAND_CORNER.indexOf('t') !== -1 ? margin : h - markH - margin;
+  return { x, y, w: markW, h: markH };
+}
+
+/**
+ * A feathered mask, cached, so the patch has no visible edge.
+ *
+ * A hard rectangle of blur in the corner of an otherwise sharp frame reads as
+ * a smudge someone left there - worse than the logo it is hiding. The mask is
+ * a white block on black with its edges blurred, used as the alpha channel of
+ * the patch, so the correction is total in the middle and nothing at all at
+ * the boundary.
+ */
+async function ensurePatchMask(w, h, feather) {
+  const f = Math.max(8, Math.round(feather));
+  const file = path.join(os.tmpdir(), `dss-patchmask-${w}x${h}-${f}.png`);
+  if (fs.existsSync(file)) return file;
+  // The white block is inset by the feather on the top and the right only,
+  // and left flush against the left and bottom edges - the two the patch shares
+  // with the frame. Blurring then runs the alpha from solid down to nothing
+  // INSIDE the mask, which is the part the first attempt got wrong: it blurred
+  // on an oversized canvas and cropped through the middle of the ramp, so the
+  // mask ended at 52% alpha and left a hard rectangle edge on the video.
+  await ffmpeg(['-f', 'lavfi', '-i', `color=black:s=${w}x${h}`,
+    '-vf', `drawbox=x=0:y=${f}:w=${w - f}:h=${h - f}:color=white:t=fill,`
+      + `boxblur=${Math.round(f * 0.5)}:2,format=gray`,
+    '-frames:v', '1', file], { timeoutMs: 60000 });
+  return file;
+}
+
+/**
+ * Take the old logo off a loop that is already built, and put the new one on.
+ *
+ * This exists because /jobs/reloop could not do it. Reloop rebuilds a loop from
+ * the raw clip in DIRS.visuals, and on 2026-09-08 that directory turned out to
+ * be empty - the fal clips behind the thirty beaches had been swept. The job
+ * failed instantly with "no raw clips matched" and the whole library was left
+ * carrying SALTWATER in its pixels with no source to rebuild from.
+ *
+ * Regenerating the thirty beaches at fal would have cost about $15. Jack asked
+ * for an alternative and there is a good one, because of how the old mark was
+ * applied: it is the finest detail in the frame, small text, at 0.32 opacity,
+ * in the darkest corner of a night scene. Three things in sequence remove it:
+ *
+ *   1. a heavy local blur, which destroys letterforms at that scale
+ *   2. a small darkening and contrast pull, which removes the faint even
+ *      lightening that 32%-opacity white leaves behind once it is blurred
+ *   3. the new lockup at 0.80 over the same footprint - more than twice the
+ *      strength of what was there
+ *
+ * The cost is one more H.264 pass over an 18.5-second loop. That is worth
+ * being precise about: the two-hour session stream-copies this loop rather
+ * than re-encoding it, so this is a single generation of loss on a short clip,
+ * not a re-encode of two hours of video.
+ *
+ * Writes to a temp file and renames over the original, so an interrupted job
+ * cannot leave a half-written loop where a session will find it tonight.
+ */
+app.post('/jobs/repatch', (req, res) => {
+  const body = req.body || {};
+  const wanted = Array.isArray(body.slugs) ? body.slugs.map(slugSafe).filter(Boolean) : null;
+  const crf = Math.round(clampNum(Number(body.crf), 14, 34, LOOP_CRF));
+  const maxrate = Math.round(clampNum(Number(body.maxrate), 600, 6000, LOOP_MAXRATE));
+  const dry = body.dry_run === true;
+
+  const job = startJob('repatch', { slugs: wanted ? wanted.length : 'all' }, async (j) => {
+    const files = await fsp.readdir(DIRS.loops).catch(() => []);
+    const present = files.filter((f) => f.endsWith('_loop.mp4')).map((f) => f.slice(0, -9));
+    const targets = wanted ? present.filter((s) => wanted.indexOf(s) !== -1) : present;
+    const missing = wanted ? wanted.filter((s) => present.indexOf(s) === -1) : [];
+    if (!targets.length) throw new Error('no loops matched');
+    if (body.mark !== false && !ensureLockup()) throw new Error('no lockup to apply');
+
+    const done = [];
+    for (const slug of targets) {
+      const src = path.join(DIRS.loops, `${slug}_loop.mp4`);
+      const dims = await probeVideoSize(src);
+      if (!dims) { step(j, `skipped ${slug} - could not read its size`); continue; }
+      // The mask and the lockup are looped stills, which are infinite streams.
+      // Without an explicit length ffmpeg encodes until the disk fills - the
+      // output is as long as the LONGEST input, not the first one.
+      const srcSecs = await probeDuration(src).catch(() => 0);
+      if (!(srcSecs > 0.2)) { step(j, `skipped ${slug} - no readable duration`); continue; }
+      const box = markBox(dims.w, dims.h);
+      // The patch runs to the two frame edges of its own corner rather than
+      // being a rectangle floating inside the picture. Two reasons, both learned
+      // by looking at a test render rather than by reasoning about it:
+      //
+      // A box sized to the arithmetic did not cover the logo. The lockup art
+      // carries transparent padding, so its ink lands a little lower and wider
+      // than the overlay box predicts, and the feathered edge of the mask ate
+      // another thirty pixels on each side - the S and the R of SALTWATER
+      // survived on either side of the patch, which is worse than not trying.
+      //
+      // And a four-sided box is visible as a box. Anchored into the corner
+      // there are only two edges that meet picture at all, and a wide feather
+      // on those two reads as a vignette, which is a thing videos have.
+      const px = 0;
+      // Generous on both counts, because the feather is consumed from the
+      // inside: the mask is only fully opaque up to about a feather and a half
+      // short of its own edge, so the patch has to start well clear of the ink.
+      const py = Math.max(0, box.y - box.h);
+      const pw = Math.min(dims.w, box.x + box.w + Math.round(box.w * 0.8));
+      const ph = dims.h - py;
+      const feather = Math.round(box.w * 0.26);
+      const mask = await ensurePatchMask(pw, ph, feather);
+      const out = path.join(DIRS.tmp, `${slug}_repatch.mp4`);
+      const blur = Math.max(10, Math.round(box.h * 0.14));
+      // A vertical loop gets the old mark taken OFF and nothing put back.
+      // Shorts and Reels carry no mark, by decision on 2026-09-06, and a mark
+      // burned into a native 9:16 loop is the one case the renderer cannot
+      // undo later - a 16:9 crop throws that corner away, a vertical clip has
+      // no corner to throw. So this is the only chance to clean them.
+      const wantMark = dims.w >= dims.h && body.mark !== false;
+
+      step(j, `patching ${slug} (${dims.w}x${dims.h}) over ${pw}x${ph} at ${px},${py}`
+        + `${wantMark ? '' : ', no mark going back on'}`);
+      if (dry) { done.push({ slug, box, patch: { px, py, pw, ph }, mark: wantMark }); continue; }
+
+      const cover = `[0:v]split=2[base][src];`
+        + `[src]crop=${pw}:${ph}:${px}:${py},boxblur=${blur}:2,`
+        + `eq=brightness=-0.04:contrast=0.95,format=rgba[pb];`
+        + `[pb][1:v]alphamerge[pm];`
+        + `[base][pm]overlay=${px}:${py}`;
+      const chain = wantMark
+        ? `${cover}[cov];`
+          + `[2:v]scale=${box.w}:-1:flags=lanczos,format=rgba,`
+          + `colorchannelmixer=aa=${BRAND_OPACITY.toFixed(3)}[lg];`
+          + `[cov][lg]overlay=${box.x}:${box.y}:eof_action=repeat,format=yuv420p[v]`
+        : `${cover},format=yuv420p[v]`;
+
+      await ffmpeg([
+        '-i', src, '-loop', '1', '-i', mask,
+        ...(wantMark ? ['-loop', '1', '-i', LOCKUP_PATH] : []),
+        '-filter_complex', chain,
+        '-map', '[v]', '-an', '-t', srcSecs.toFixed(3),
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', String(crf),
+        '-maxrate', `${maxrate}k`, '-bufsize', `${maxrate * 2}k`,
+        '-movflags', '+faststart', out,
+      ], { timeoutMs: 10 * 60 * 1000 });
+
+      const bytes = await fsp.stat(out).then((st) => st.size).catch(() => 0);
+      if (bytes < 10000) throw new Error(`repatch produced an empty file for ${slug}`);
+      const secs = await probeDuration(out).catch(() => 0);
+      await fsp.rename(out, src);
+      done.push({ slug, marked: wantMark, bytes, seconds: Number(secs.toFixed(2)),
+        projected_2h_gb: secs > 0 ? Number(((bytes / secs) * 7200 / 1e9).toFixed(2)) : 0 });
+      step(j, `  ${slug} rewritten, ${(bytes / 1e6).toFixed(1)} MB`);
+    }
+
+    return { patched: done.length, dry_run: dry, detail: done, missing,
+      brand: brandStatus(), disk: await diskUsage() };
   });
   res.status(202).json({ job_id: job.id, status: job.status });
 });
