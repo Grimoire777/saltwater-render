@@ -2183,9 +2183,32 @@ const TIP_SIZE = clampNum(Number(process.env.SHORT_TIP_SIZE), 28, 120, 54);
 // a footnote to the first, and it is not a footnote — the two beats are equal
 // halves of the same message, one after the other, in the same voice.
 const CTA_SIZE = clampNum(Number(process.env.SHORT_CTA_SIZE), 24, 120, TIP_SIZE);
-// The place line at the top runs for the whole clip and is the quietest thing
-// on screen, so it sits below the quote in size.
-const PLACE_SIZE = clampNum(Number(process.env.SHORT_PLACE_SIZE), 20, 90, 40);
+/*
+ * The place line is the same size as everything else, from 2026-09-08.
+ *
+ * It used to be 40px against the quote's 54, on the reasoning that a line held
+ * for the whole clip should be the quietest thing on screen. Jack looked at a
+ * finished render and said the opposite: every piece of writing should match
+ * "Two hours of this is waiting for you" exactly — same style, same colour,
+ * same everything.
+ *
+ * He is right, and the reason is that a Short is not a page. On a page a
+ * hierarchy of sizes tells you what to read first. Here the three zones are
+ * already separated by WHEN they appear and WHERE they sit, so a size
+ * difference adds no information and only reads as one of them being an
+ * afterthought. One size, one colour, one peak opacity, three positions.
+ */
+const PLACE_SIZE = clampNum(Number(process.env.SHORT_PLACE_SIZE), 20, 120, TIP_SIZE);
+
+/*
+ * How bright the text gets at its peak, once for every zone.
+ *
+ * These were 0.88 for the place, 0.95 for the beats and 0.92 for the offer -
+ * three numbers nobody chose together, and on screen the place line looked
+ * washed out beside the rest. Same reasoning as the size: the zones are
+ * distinguished by time and position, not by being dimmer than each other.
+ */
+const TEXT_PEAK = clamp01(Number(process.env.SHORT_TEXT_PEAK ?? 0.92));
 
 /*
  * Pale sand, not white.
@@ -2820,10 +2843,17 @@ async function renderShort(job, input) {
 
     // ------------------------------------------------------------ the place
     if (place) {
-      const fit = await layoutCaption(place, PLACE_SIZE, TEXT_MAX_W, 1);
-      await drawOne(fit.lines.join(' '), fit.size, 'h*0.085',
-        textAlpha(0.4, seconds - 0.5, 1.4, 0.88), 'place');
-      step(job, `place: ${JSON.stringify(fit.lines.join(' '))} at ${fit.size}px`);
+      // Two lines allowed now that the place is set at full size: a long one
+      // like "Glowing Water at Mosquito Bay, Vieques" no longer fits across
+      // 968px at 54px, and wrapping it is right where shrinking it is not -
+      // shrinking is the thing Jack asked to stop.
+      const fit = await layoutCaption(place, PLACE_SIZE, TEXT_MAX_W, 2);
+      const plead = Math.round(fit.size * 1.5);
+      const pal = textAlpha(0.4, seconds - 0.5, 1.4, TEXT_PEAK);
+      for (let i = 0; i < fit.lines.length; i += 1) {
+        await drawOne(fit.lines[i], fit.size, `h*0.085+${i * plead}`, pal, `place${i}`);
+      }
+      step(job, `place: ${JSON.stringify(fit.lines)} at ${fit.size}px`);
     }
 
     // ------------------------------------------------------------ the quote
@@ -2840,13 +2870,20 @@ async function renderShort(job, input) {
       const wins = beatWindows(beats, seconds);
       const FADE = 1.1;
       for (let bi = 0; bi < beats.length; bi += 1) {
-        const fit = await layoutCaption(beats[bi], TIP_SIZE, TEXT_MAX_W, 3);
+        // Four lines, not three. Three was right when a shrink was an
+        // acceptable fallback; now that every zone must render at the same
+        // size, wrapping has to absorb everything wrapping can. Measured
+        // against the whole list in the real font: the longest beat (111
+        // characters) takes four lines at 54px and nothing takes five, so
+        // nothing shrinks. Four lines at 81px of lead is 324px, centred at
+        // 0.46h — still clear of the offer at 0.72h.
+        const fit = await layoutCaption(beats[bi], TIP_SIZE, TEXT_MAX_W, 4);
         const lead = Math.round(fit.size * 1.5);
         const block = fit.lines.length * lead;
         const per = wins[bi].dur;
         const t0 = wins[bi].at;
         const t1 = t0 + per;
-        const al = textAlpha(t0 + 0.15, t1 - 0.15, FADE, 0.95);
+        const al = textAlpha(t0 + 0.15, t1 - 0.15, FADE, TEXT_PEAK);
         for (let li = 0; li < fit.lines.length; li += 1) {
           const y = `(h*0.46-${Math.round(block / 2)})+${li * lead}`
             + `-26*(t-${t0.toFixed(2)})/${per.toFixed(2)}`;
@@ -2863,7 +2900,7 @@ async function renderShort(job, input) {
     if (cta) {
       const fit = await layoutCaption(cta, CTA_SIZE, TEXT_MAX_W, 2);
       const lead = Math.round(fit.size * 1.5);
-      const al = textAlpha(ctaAt, seconds - 0.4, 1.4, 0.92);
+      const al = textAlpha(ctaAt, seconds - 0.4, 1.4, TEXT_PEAK);
       for (let i = 0; i < fit.lines.length; i += 1) {
         await drawOne(fit.lines[i], fit.size, `h*0.72+${i * lead}`, al, `cta${i}`);
       }
