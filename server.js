@@ -1484,10 +1484,11 @@ async function makeImportVisual(job, { slug, aspect, url, dim, vivid, start, sou
  * Returns null rather than throwing when there is no voice configured, so a
  * Short without narration is still a Short.
  */
-async function speak(job, { text, voice_id, out }) {
+async function speak(job, { text, voice_id, out, speed }) {
   const vid = String(voice_id || SHORT_VOICE_ID || '').trim();
   if (!vid || !String(text || '').trim()) return null;
-  step(job, `speaking ${String(text).length} characters in voice ${vid}`);
+  const rate = clampNum(Number(speed), 0.7, 1.2, VOICE_SPEED);
+  step(job, `speaking ${String(text).length} characters in voice ${vid} at ${rate}x`);
   const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${vid}`, {
     method: 'POST',
     headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
@@ -1497,7 +1498,13 @@ async function speak(job, { text, voice_id, out }) {
       output_format: 'mp3_44100_128',
       // Stability high and style at zero on purpose: this is a sleep channel,
       // and an expressive read is the wrong instrument entirely.
-      voice_settings: { stability: 0.70, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true },
+      voice_settings: {
+        stability: VOICE_STABILITY,
+        similarity_boost: 0.75,
+        style: VOICE_STYLE,
+        speed: rate,
+        use_speaker_boost: true,
+      },
     }),
   });
   if (!res.ok) throw new Error(`elevenlabs tts ${res.status}: ${(await res.text()).slice(0, 500)}`);
@@ -2199,6 +2206,24 @@ const TEXT_COLOR = String(process.env.SHORT_TEXT_COLOR || '#E6D3B3');
 // lists what the account actually has.
 const SHORT_VOICE_ID = String(process.env.SHORT_VOICE_ID || '');
 
+/*
+ * How the voice reads, as variables rather than constants.
+ *
+ * The first render came back too fast. That is a judgement nobody can make
+ * before hearing it, and it will be made again every time the voice or the
+ * writing changes - so these are Railway variables and tuning them costs a
+ * restart rather than a deploy.
+ *
+ *   speed       0.7 slowest, 1.2 fastest, 1.0 as ElevenLabs ships it.
+ *               0.85 is a read, not an announcement.
+ *   stability   higher is flatter and more predictable.
+ *   style       expressiveness. Zero on purpose: this is a sleep channel and
+ *               an expressive read is the wrong instrument entirely.
+ */
+const VOICE_SPEED = clampNum(Number(process.env.SHORT_VOICE_SPEED), 0.7, 1.2, 0.85);
+const VOICE_STABILITY = clamp01(Number(process.env.SHORT_VOICE_STABILITY ?? 0.75));
+const VOICE_STYLE = clamp01(Number(process.env.SHORT_VOICE_STYLE ?? 0));
+
 /**
  * The two gradient scrims, built once and kept in tmp.
  *
@@ -2800,12 +2825,21 @@ async function renderShort(job, input) {
     for (let i = 0; i < speakBeats.length; i += 1) {
       const out = path.join(DIRS.tmp, `${runId}_voice${i}.mp3`);
       try {
-        const f = await speak(job, { text: speakBeats[i], voice_id: voiceId, out });
+        const f = await speak(job, {
+          text: speakBeats[i], voice_id: voiceId, out, speed: input.voice_speed,
+        });
         if (f) {
           written.push(f);
           // A second of picture before anyone speaks. Opening on a voice is
           // startling, which is the opposite of the job.
           voices.push({ file: f, at: i * per + 1.0 });
+          // Slowing the read is free until a beat runs past its own window and
+          // starts talking over the next line. Measured, not assumed.
+          const spoken = await probeDuration(f).catch(() => 0);
+          if (spoken > per - 1.2) {
+            step(job, `WARNING: beat ${i + 1} speaks for ${spoken.toFixed(1)}s `
+              + `inside a ${per.toFixed(1)}s window - it will run into the next line`);
+          }
         }
       } catch (err) {
         step(job, `voice failed on beat ${i + 1}: ${err.message} — continuing without it`);
