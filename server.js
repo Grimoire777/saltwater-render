@@ -2201,6 +2201,21 @@ const PLACE_SIZE = clampNum(Number(process.env.SHORT_PLACE_SIZE), 20, 90, 40);
  */
 const TEXT_COLOR = String(process.env.SHORT_TEXT_COLOR || '#E6D3B3');
 
+/*
+ * The stroke that makes the colour survive a bright frame.
+ *
+ * As a fraction of the type size, so it holds at every size the layout can
+ * shrink to: 0.055 gives a 40px place line a 2px edge and a 76px beat a 4px
+ * one. Below about 2px an outline stops reading as an edge and starts reading
+ * as anti-aliasing, which is why there is a floor in drawTextClause.
+ *
+ * The alpha is 0.85 rather than 1.0 so the edge is a shadow of a letterform
+ * rather than a hard cartoon key line. On the dark half of the library it is
+ * invisible at either value; the difference only shows on white sand.
+ */
+const TEXT_STROKE_RATIO = clampNum(Number(process.env.SHORT_TEXT_STROKE), 0, 0.15, 0.055);
+const TEXT_STROKE_ALPHA = clamp01(Number(process.env.SHORT_TEXT_STROKE_ALPHA ?? 0.85));
+
 // A calm female read. Overridable per job, because the right voice is a
 // judgement made by listening rather than a value to derive - GET /voices
 // lists what the account actually has.
@@ -2223,6 +2238,38 @@ const SHORT_VOICE_ID = String(process.env.SHORT_VOICE_ID || '');
 const VOICE_SPEED = clampNum(Number(process.env.SHORT_VOICE_SPEED), 0.7, 1.2, 0.85);
 const VOICE_STABILITY = clamp01(Number(process.env.SHORT_VOICE_STABILITY ?? 0.75));
 const VOICE_STYLE = clamp01(Number(process.env.SHORT_VOICE_STYLE ?? 0));
+
+/*
+ * How loud the voice sits against the music, as a measurement rather than a
+ * multiplier.
+ *
+ * The first version multiplied every spoken beat by a fixed 1.6 and stepped
+ * the bed back 5 dB. Both numbers were guesses tuned to one voice, and the
+ * arithmetic underneath them was worse than it looked: the beds are mastered
+ * to about -23 LUFS, so -5 dB put the music near -28, while ElevenLabs
+ * returned Rachel at -19.3 LUFS and 1.6x lifted her to roughly -15. That is a
+ * thirteen decibel gap. The music was still playing; nobody could hear it.
+ *
+ * A fixed multiplier cannot be right, because it is applied to whatever level
+ * the API happens to return, and that differs by voice, by model and by
+ * setting: three Rachel files measured -17.0, -19.3 and -19.8 LUFS, a spread
+ * of nearly three decibels from one voice. So every beat is now MEASURED
+ * after it is
+ * generated and given the exact gain that lands it on VOICE_LUFS. Different
+ * voice, same balance, no retuning.
+ *
+ *   VOICE_LUFS   where the read sits. -20 against beds at -23 leaves the
+ *                voice about six decibels forward of the music once the duck
+ *                is applied - present, not over the top of it.
+ *   BED_DUCK_DB  how far the bed steps back while anyone is speaking. Small
+ *                on purpose: Jack's note was that the music disappeared, and
+ *                a constant step is what keeps the bed audible without a
+ *                sidechain gate opening and closing across thirty seconds of
+ *                near-continuous speech, which is plainly audible on music
+ *                this quiet.
+ */
+const VOICE_LUFS = clampNum(Number(process.env.SHORT_VOICE_LUFS), -40, -6, -20);
+const BED_DUCK_DB = clampNum(Number(process.env.SHORT_BED_DUCK_DB), -12, 0, -3);
 
 /**
  * The two gradient scrims, built once and kept in tmp.
@@ -2461,7 +2508,30 @@ async function layoutCaption(raw, size, maxWidth, maxLines) {
   return best;
 }
 
+/**
+ * One line of text on the picture.
+ *
+ * The outline is the whole point of this function.
+ *
+ * Every scrim in this renderer was tuned against near-black artwork, where a
+ * drop shadow is enough because the letters are already lighter than anything
+ * behind them. The beach series broke that assumption: Luskentyre is white
+ * sand under a low moon, and pale sand lettering (#E6D3B3) laid over pale wet
+ * sand is very nearly the same value as its own background. Jack could not
+ * read it. A drop shadow does not save it either — the shadow sits below and
+ * behind the glyph, so on a bright frame it reads as a smudge rather than an
+ * edge.
+ *
+ * The fix is a stroke, not a different colour. Going whiter fails on white
+ * sand and going black fails on every night-water scene in the library, and
+ * the library has both. An outline is the only treatment that works in both
+ * directions at once: over dark water it is invisible because it is black on
+ * black, and over bright sand it is what separates the letter from the
+ * ground. The width scales with the type size so a 40px place line and a 76px
+ * beat get proportionally the same weight of edge.
+ */
 function drawTextClause(file, size, yExpr, alphaExpr, colour) {
+  const stroke = Math.max(2, Math.round(Number(size) * TEXT_STROKE_RATIO));
   return [
     `drawtext=fontfile=${findFont()}`,
     `textfile=${file}`,
@@ -2471,6 +2541,8 @@ function drawTextClause(file, size, yExpr, alphaExpr, colour) {
     'line_spacing=16',
     'x=(w-text_w)/2',
     `y=${yExpr}`,
+    `bordercolor=black@${TEXT_STROKE_ALPHA}`,
+    `borderw=${stroke}`,
     'shadowcolor=black@0.65',
     'shadowx=0',
     'shadowy=4',
@@ -2830,9 +2902,27 @@ async function renderShort(job, input) {
         });
         if (f) {
           written.push(f);
+          // What the API actually returned, in LUFS, and the gain that puts it
+          // where the mix wants it. Measured per beat because the level moves
+          // between reads even from one voice: this is the difference between
+          // "the voice is too loud" being a setting and being a rebuild.
+          //
+          // The clamp is a safety rail, not a preference. A beat that comes
+          // back near silence - a failed read, a clipped file - would otherwise
+          // ask for 40 dB of gain and arrive as a wall of hiss.
+          const heard = await integratedAfter(f).catch(() => null);
+          const gain = Number.isFinite(heard)
+            ? clampNum(VOICE_LUFS - heard, -12, 12, 0)
+            : 0;
+          if (Number.isFinite(heard)) {
+            step(job, `beat ${i + 1} came back at ${heard.toFixed(1)} LUFS, `
+              + `${gain >= 0 ? '+' : ''}${gain.toFixed(1)} dB to reach ${VOICE_LUFS}`);
+          } else {
+            step(job, `beat ${i + 1} loudness unreadable - mixing it flat`);
+          }
           // A second of picture before anyone speaks. Opening on a voice is
           // startling, which is the opposite of the job.
-          voices.push({ file: f, at: i * per + 1.0 });
+          voices.push({ file: f, at: i * per + 1.0, gain: gain });
           // Slowing the read is free until a beat runs past its own window and
           // starts talking over the next line. Measured, not assumed.
           const spoken = await probeDuration(f).catch(() => 0);
@@ -2871,16 +2961,22 @@ async function renderShort(job, input) {
   let vi = drawMark ? 5 : 4;
   const tail = `${sleepDrc()}afade=t=in:st=0:d=1.5,afade=t=out:st=${fadeOut}:d=2`;
   if (voices.length) {
-    // The bed steps back five decibels for the whole clip rather than ducking
-    // under a sidechain. On thirty seconds of near-continuous speech a gate
-    // would be opening and closing throughout, and every one of those moves is
-    // audible on music this quiet. A constant step is inaudible.
-    const chain = [`[1:a]volume=-5dB[bed]`];
+    // The bed steps back a constant amount for the whole clip rather than
+    // ducking under a sidechain. On thirty seconds of near-continuous speech a
+    // gate would be opening and closing throughout, and every one of those
+    // moves is audible on music this quiet. A constant step is inaudible.
+    //
+    // Three decibels, not five: the point of a bed under a voice on this
+    // channel is that you can still hear the harp.
+    const chain = [`[1:a]volume=${BED_DUCK_DB}dB[bed]`];
     const labels = ['[bed]'];
     for (let i = 0; i < voices.length; i += 1) {
       const ms = Math.round(voices[i].at * 1000);
       args.push('-i', voices[i].file);
-      chain.push(`[${vi + i}:a]adelay=${ms}|${ms},volume=1.6[vx${i}]`);
+      // Per-beat gain from the measurement above, so each line lands on the
+      // same loudness whatever the API sent back.
+      chain.push(`[${vi + i}:a]adelay=${ms}|${ms},`
+        + `volume=${Number(voices[i].gain || 0).toFixed(2)}dB[vx${i}]`);
       labels.push(`[vx${i}]`);
     }
     chain.push(`${labels.join('')}amix=inputs=${labels.length}:duration=first`
@@ -3836,8 +3932,19 @@ app.post('/jobs/short', (req, res) => {
   }
   const job = startJob('short', { run_id: input.run_id, visual_slug: input.visual_slug }, async (j) => {
     const file = await renderShort(j, input);
+    // A narrated Short has words in it, so "zxx" — no linguistic content — is
+    // no longer the honest answer, and YouTube rejects it outright: every
+    // narrated upload so far logged `audio language "zxx" rejected` and lost
+    // the whole combined metadata call with it. The silent Shorts and the
+    // two-hour sessions keep zxx, which is still correct for them.
+    const speaks = input.speak !== false
+      && String(input.voice_id || SHORT_VOICE_ID || '').trim()
+      && (Array.isArray(input.beats) ? input.beats.filter(Boolean).length : 0) > 0;
     // Shorts never go in the sessions playlist — see YT_PLAYLIST_ID.
-    const videoId = await uploadToYouTube(j, file, Object.assign({}, input, { playlist_id: 'none' }));
+    const videoId = await uploadToYouTube(j, file, Object.assign({}, input, {
+      playlist_id: 'none',
+      audio_language: input.audio_language || (speaks ? 'en' : AUDIO_LANGUAGE),
+    }));
     await fsp.rm(file, { force: true });
     step(j, 'deleted local render after successful upload');
     return { video_id: videoId, disk: await diskUsage() };
