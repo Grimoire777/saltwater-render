@@ -2271,6 +2271,63 @@ const VOICE_STYLE = clamp01(Number(process.env.SHORT_VOICE_STYLE ?? 0));
 const VOICE_LUFS = clampNum(Number(process.env.SHORT_VOICE_LUFS), -40, -6, -20);
 const BED_DUCK_DB = clampNum(Number(process.env.SHORT_BED_DUCK_DB), -12, 0, -3);
 
+/*
+ * The shortest a beat may be on screen, whatever the arithmetic says.
+ *
+ * Without a floor, proportional windows do something silly with a quote like
+ * 48 / 11 / 98 characters: the eleven-character line gets 2.1 seconds and
+ * flashes past before anyone has focused on it. Five and a half seconds is
+ * long enough to read a short line twice, which is the same test the even
+ * split was meeting.
+ */
+const BEAT_MIN_SEC = clampNum(Number(process.env.SHORT_BEAT_MIN_SEC), 2, 15, 5.5);
+
+/**
+ * When each beat is on screen, and for how long.
+ *
+ * The first version gave every beat an equal share, which is right only when
+ * the sentences are of equal length. Across Jack's hundred quotes they are
+ * not: one splits 26 / 31 / 116 characters, and an even third gave the
+ * 116-character line the same ten seconds as the 26-character one. At the read
+ * speed he approved that line takes about thirteen seconds to say, so the
+ * voice was still finishing it while the next line was already on screen.
+ * Nineteen of the hundred had that fault.
+ *
+ * Sizing each window to its own line fixes all nineteen: that quote now runs
+ * 4.5 / 5.4 / 20.1 seconds. Both the picture and the voice read from this, so
+ * a line's window and its read can never drift apart — which is the whole
+ * reason it is one function rather than two similar expressions.
+ *
+ * Character count is the right proxy for how long a line takes to say. It is
+ * also the right proxy for how long it takes to read, which is why the same
+ * split serves both.
+ */
+function beatWindows(beats, seconds) {
+  const n = beats.length;
+  if (!n) return [];
+  const lens = beats.map((b) => Math.max(1, String(b).length));
+  const total = lens.reduce((a, x) => a + x, 0);
+  const floor = Math.min(BEAT_MIN_SEC, seconds / n);
+  const w = lens.map((x) => (seconds * x) / total);
+  // Lift anything under the floor and take the time from the longest window,
+  // which is the one that can most afford it. Bounded: each pass fixes one
+  // window and a window already at the floor is never chosen as the donor.
+  for (let guard = 0; guard < n * 2; guard += 1) {
+    const lo = w.findIndex((x) => x < floor - 1e-6);
+    if (lo === -1) break;
+    let hi = 0;
+    for (let i = 1; i < n; i += 1) if (w[i] > w[hi]) hi = i;
+    if (hi === lo || w[hi] - (floor - w[lo]) < floor) break;
+    const need = floor - w[lo];
+    w[lo] += need;
+    w[hi] -= need;
+  }
+  const out = [];
+  let t = 0;
+  for (let i = 0; i < n; i += 1) { out.push({ at: t, dur: w[i] }); t += w[i]; }
+  return out;
+}
+
 /**
  * The two gradient scrims, built once and kept in tmp.
  *
@@ -2780,13 +2837,14 @@ async function renderShort(job, input) {
     const ctaAt = Math.max(0, seconds - ctaHold);
 
     if (beats.length) {
-      const per = seconds / beats.length;
+      const wins = beatWindows(beats, seconds);
       const FADE = 1.1;
       for (let bi = 0; bi < beats.length; bi += 1) {
         const fit = await layoutCaption(beats[bi], TIP_SIZE, TEXT_MAX_W, 3);
         const lead = Math.round(fit.size * 1.5);
         const block = fit.lines.length * lead;
-        const t0 = bi * per;
+        const per = wins[bi].dur;
+        const t0 = wins[bi].at;
         const t1 = t0 + per;
         const al = textAlpha(t0 + 0.15, t1 - 0.15, FADE, 0.95);
         for (let li = 0; li < fit.lines.length; li += 1) {
@@ -2795,7 +2853,8 @@ async function renderShort(job, input) {
           await drawOne(fit.lines[li], fit.size, y, al, `b${bi}_${li}`);
         }
         step(job, `beat ${bi + 1}/${beats.length} at ${fit.size}px, `
-          + `${fit.lines.length} line(s), ${t0.toFixed(0)}-${t1.toFixed(0)}s: `
+          + `${fit.lines.length} line(s), ${t0.toFixed(1)}-${t1.toFixed(1)}s `
+          + `(${per.toFixed(1)}s for ${beats[bi].length} characters): `
           + JSON.stringify(fit.lines));
       }
     }
@@ -2893,8 +2952,11 @@ async function renderShort(job, input) {
   const voiceId = String(input.voice_id || SHORT_VOICE_ID || '').trim();
   const voices = [];
   if (input.speak !== false && voiceId && speakBeats.length) {
-    const per = seconds / speakBeats.length;
+    // The same windows the picture uses, from the same function. Computing the
+    // timing twice is how a line and its read drift apart.
+    const wins = beatWindows(speakBeats, seconds);
     for (let i = 0; i < speakBeats.length; i += 1) {
+      const per = wins[i].dur;
       const out = path.join(DIRS.tmp, `${runId}_voice${i}.mp3`);
       try {
         const f = await speak(job, {
@@ -2922,7 +2984,7 @@ async function renderShort(job, input) {
           }
           // A second of picture before anyone speaks. Opening on a voice is
           // startling, which is the opposite of the job.
-          voices.push({ file: f, at: i * per + 1.0, gain: gain });
+          voices.push({ file: f, at: wins[i].at + 1.0, gain: gain });
           // Slowing the read is free until a beat runs past its own window and
           // starts talking over the next line. Measured, not assumed.
           const spoken = await probeDuration(f).catch(() => 0);
