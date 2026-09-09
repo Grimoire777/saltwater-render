@@ -4812,6 +4812,184 @@ app.get('/voices', async (_req, res) => {
   }
 });
 
+/**
+ * A montage: several scenes in sequence, each named, over one piece of music.
+ *
+ * Different from a Short in every way that matters. A Short holds ONE picture
+ * and carries the writing — a quote, an offer, the channel's promise. This
+ * holds several and carries nothing but the name of the place. It exists to
+ * show that the library is real: five named coastlines in five countries, each
+ * one a place you could go to.
+ *
+ * Built for delivery rather than publication. `renderMontage` leaves the file
+ * on the volume and hands back its name; nothing is uploaded anywhere. Fetch it
+ * with GET /renders/:name, which is behind the same key as everything else.
+ */
+async function renderMontage(job, input) {
+  const runId = slugSafe(input.run_id || `montage_${Date.now().toString(36)}`);
+  const segments = (Array.isArray(input.segments) ? input.segments : [])
+    .map((sg) => ({ slug: slugSafe(sg.visual_slug), place: String(sg.place || '').trim() }))
+    .filter((sg) => sg.slug);
+  if (segments.length < 2) throw new Error('a montage needs at least two segments');
+
+  const total = clampNum(Number(input.seconds), 10, 300, 60);
+  // The crossfade is subtracted from the running time, not added to it: two
+  // clips overlapping for a second occupy one second less than they would end
+  // to end. Sizing the segments without accounting for that is how a montage
+  // asked for 60 seconds arrives at 55.
+  const fade = clampNum(Number(input.crossfade), 0.3, 3, 1.2);
+  const per = (total + fade * (segments.length - 1)) / segments.length;
+
+  const W = 1080;
+  const H = 1920;
+  const font = findFont();
+  const written = [];
+  const args = [];
+  const parts = [];
+
+  for (let i = 0; i < segments.length; i += 1) {
+    const loopPath = path.join(DIRS.loops, `${segments[i].slug}_loop.mp4`);
+    if (!fs.existsSync(loopPath)) throw new Error(`visual loop missing: ${loopPath}`);
+    // Every source is a short palindromic loop, so it has to be repeated to
+    // fill its segment rather than played once.
+    args.push('-stream_loop', '-1', '-t', per.toFixed(3), '-i', loopPath);
+  }
+
+  // The same gradient at the top a Short uses. Only the top one here: there is
+  // nothing in the lower third of a montage to keep legible.
+  const TOP_SCRIM = 480;
+  const scrims = await ensureScrims(W, TOP_SCRIM, 740);
+  const scrimIdx = segments.length;
+  args.push('-loop', '1', '-i', scrims.top);
+
+  const TEXT_MAX_W = W - 112;
+  let textInput = scrimIdx + 1;
+
+  for (let i = 0; i < segments.length; i += 1) {
+    // 16:9 into 9:16 by filling and cropping the middle, the same way a Short
+    // does it - which is also what throws the branded corner away.
+    let chain = `[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,`
+      + `crop=${W}:${H},setsar=1,fps=30[c${i}];`
+      + `[c${i}][${scrimIdx}:v]overlay=0:0[s${i}]`;
+    let last = `[s${i}]`;
+
+    if (font && segments[i].place) {
+      const fit = await layoutCaption(segments[i].place, PLACE_SIZE, TEXT_MAX_W, 2);
+      const lead = Math.round(fit.size * 1.5);
+      // Held for the whole segment, fading with the picture rather than
+      // arriving separately - the name IS the segment, not a caption on it.
+      const al = textAlpha(0.3, per - 0.3, 0.9, TEXT_PEAK);
+      for (let li = 0; li < fit.lines.length; li += 1) {
+        const f = path.join(DIRS.tmp, `${runId}_p${i}_${li}.txt`);
+        await fsp.writeFile(f, fit.lines[li], 'utf8');
+        written.push(f);
+        chain += `;${last}${drawTextClause(f, fit.size, `h*0.085+${li * lead}`, al)}[t${i}_${li}]`;
+        last = `[t${i}_${li}]`;
+      }
+      step(job, `segment ${i + 1}: ${segments[i].slug} — `
+        + `${JSON.stringify(fit.lines)} at ${fit.size}px, ${per.toFixed(1)}s`);
+    }
+    chain += `;${last}format=yuv420p[v${i}]`;
+    parts.push(chain);
+  }
+
+  // Chained crossfades. Each offset is where the NEXT clip starts overlapping
+  // the running result, so it accumulates: one segment less one fade, each time.
+  let vlabel = '[v0]';
+  let offset = per - fade;
+  for (let i = 1; i < segments.length; i += 1) {
+    const out = i === segments.length - 1 ? '[vout]' : `[xf${i}]`;
+    parts.push(`${vlabel}[v${i}]xfade=transition=fade:duration=${fade.toFixed(3)}`
+      + `:offset=${offset.toFixed(3)}${out}`);
+    vlabel = out;
+    offset += per - fade;
+  }
+
+  // -------------------------------------------------------------- the music
+  const trackPath = input.track_slug
+    ? path.join(DIRS.tracks, `${slugSafe(input.track_slug)}.mp3`)
+    : null;
+  if (!trackPath || !fs.existsSync(trackPath)) {
+    throw new Error(`track missing: ${trackPath || '(none given)'}`);
+  }
+  const startAt = clampNum(Number(input.audio_start_sec), 0, 600, 0);
+  args.push('-stream_loop', '-1', '-ss', String(startAt), '-t', total.toFixed(3), '-i', trackPath);
+  const aIdx = textInput;
+  parts.push(`[${aIdx}:a]${sleepDrc()}afade=t=in:st=0:d=1.5,`
+    + `afade=t=out:st=${(total - 2).toFixed(3)}:d=2[a]`);
+
+  const outPath = path.join(DIRS.renders, `${runId}.mp4`);
+  step(job, `cutting a ${total}s montage from ${segments.length} scenes, `
+    + `${per.toFixed(1)}s each with ${fade}s crossfades`);
+
+  await ffmpeg([...args,
+    '-filter_complex', parts.join(';'),
+    '-map', '[vout]', '-map', '[a]',
+    '-t', total.toFixed(3),
+    '-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-r', '30',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '44100',
+    '-movflags', '+faststart', outPath,
+  ], { timeoutMs: 20 * 60 * 1000 });
+
+  for (const f of written) await fsp.rm(f, { force: true }).catch(() => {});
+
+  const bytes = await fsp.stat(outPath).then((st) => st.size).catch(() => 0);
+  const secs = await probeDuration(outPath).catch(() => 0);
+  if (bytes < 10000) throw new Error('montage produced an empty file');
+  step(job, `verified ${(bytes / 1e6).toFixed(1)} MB, ${secs.toFixed(1)}s`);
+  return {
+    file: path.basename(outPath),
+    download: `/renders/${path.basename(outPath)}`,
+    bytes,
+    seconds: Number(secs.toFixed(2)),
+    segments: segments.map((sg) => sg.place || sg.slug),
+    disk: await diskUsage(),
+  };
+}
+
+app.post('/jobs/montage', (req, res) => {
+  const input = req.body || {};
+  const job = startJob('montage', { run_id: input.run_id }, async (j) => {
+    const built = await renderMontage(j, input);
+    // Uploaded like anything else when asked, so it can be pulled down from
+    // Studio; left on the volume for GET /renders/:name when not. A montage is
+    // a one-off, and which of those two you want depends on the day.
+    if (input.upload === false) return built;
+    const file = path.join(DIRS.renders, built.file);
+    const videoId = await uploadToYouTube(j, file, Object.assign({}, input, {
+      playlist_id: 'none',
+      // No words are spoken and none are on screen beyond place names, so the
+      // sessions' answer is the right one here.
+      audio_language: input.audio_language || AUDIO_LANGUAGE,
+    }));
+    await fsp.rm(file, { force: true });
+    step(j, 'deleted local render after successful upload');
+    return Object.assign({}, built, { video_id: videoId, download: null });
+  });
+  res.status(202).json({ job_id: job.id, status: job.status });
+});
+
+/**
+ * Hand a finished render back over the wire.
+ *
+ * The service has never had a way out except the YouTube upload, which is fine
+ * for everything it publishes and useless for a one-off someone wants as a
+ * file. This is behind the same key as every other route, and it refuses any
+ * name that is not a plain file sitting directly in the renders directory -
+ * a path is the obvious thing to get wrong here and the consequence is reading
+ * arbitrary files off the volume.
+ */
+app.get('/renders/:name', async (req, res) => {
+  const name = String(req.params.name || '');
+  if (!/^[A-Za-z0-9._-]+\.mp4$/.test(name) || name.indexOf('..') !== -1) {
+    return res.status(400).json({ error: 'bad name' });
+  }
+  const file = path.join(DIRS.renders, name);
+  if (!fs.existsSync(file)) return res.status(404).json({ error: 'not found' });
+  res.setHeader('Content-Type', 'video/mp4');
+  return res.sendFile(file);
+});
+
 app.get('/assets', async (_req, res) => {
   const loops = await fsp.readdir(DIRS.loops).catch(() => []);
   const tracks = await fsp.readdir(DIRS.tracks).catch(() => []);
